@@ -16,6 +16,7 @@ if sys.platform.startswith('win'):
         pass
 import threading
 import traceback
+import re
 from datetime import datetime
 import urllib.parse
 
@@ -49,6 +50,34 @@ TARGET_COLLECTIONS = [
 # listings of every watched collection in a single fast request.
 COMBINED_SCAN_COUNT = max(15, 10 * len(TARGET_COLLECTIONS))
 
+# ---------------------------------------------------------------------
+# FRAGMENT (fragment.com) — official Telegram collectible marketplace.
+# Read-only price monitoring: the bot reads each collection's floor on
+# Fragment and alerts you when Fragment is cheaper than MRKT, with a
+# direct buy link. Buying on Fragment requires connecting a TON wallet
+# and signing each transaction yourself, so the bot CANNOT auto-buy there
+# (there is no token like MRKT) — it watches and alerts only.
+# ---------------------------------------------------------------------
+FRAGMENT_BASE_URL = "https://fragment.com"
+# Maps our collection display names to Fragment URL slugs (lowercase, no spaces).
+FRAGMENT_SLUGS = {
+    "Vice Cream": "vicecream",
+    "Chill Flame": "chillflame",
+    "Pet Snake": "petsnake",
+    "Lol Pop": "lolpop",
+    "Mood Pack": "moodpack",
+    "Pool Float": "poolfloat",
+    "Big Year": "bigyear",
+}
+FRAGMENT_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://fragment.com/gifts",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+# Regex to pull TON price values out of Fragment's listing HTML.
+FRAGMENT_PRICE_RE = re.compile(r'tm-value icon-before icon-ton">([\d,]+)')
+
 # Default headers matching a mobile Telegram App environment
 HEADERS_TEMPLATE = {
     "Accept": "application/json, text/plain, */*",
@@ -76,11 +105,17 @@ state = {
     "consecutive_429": 0,
     "catch_chromatic": False,     # If True: also catch "chromatic" gifts at floor-or-below price
     "chromatic_threshold": 60.0,  # Max RGB color distance to treat a gift as chromatic
+    "watch_fragment": False,      # If True: monitor fragment.com floors and alert on cheaper deals
 }
 
 # Calculated market floor prices
 # Calculated as the median of the 2nd, 3rd, and 4th cheapest items to prevent outliers from skewing
 stable_floors = {c: None for c in TARGET_COLLECTIONS}
+
+# Fragment.com floor cache: {collection_name: floor_price_ton or None}
+fragment_floors = {c: None for c in TARGET_COLLECTIONS}
+# Last Fragment floor we already alerted about, to avoid repeat alerts: {collection: price}
+fragment_alerted = {}
 
 # Cache of already placed offers: {collection_name: placed_price_ton}
 # Used to skip re-placing an offer if the price hasn't changed significantly
@@ -124,6 +159,7 @@ def load_config():
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
                 state["catch_chromatic"] = bool(cfg.get("catch_chromatic", False))
                 state["chromatic_threshold"] = float(cfg.get("chromatic_threshold", 60.0))
+                state["watch_fragment"] = bool(cfg.get("watch_fragment", False))
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -158,7 +194,8 @@ def save_config():
             "offers_delay": state["offers_delay"],
             "sniper_mode": state["sniper_mode"],
             "catch_chromatic": state["catch_chromatic"],
-            "chromatic_threshold": state["chromatic_threshold"]
+            "chromatic_threshold": state["chromatic_threshold"],
+            "watch_fragment": state["watch_fragment"]
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -370,6 +407,8 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
+                "🧩 /fragment_on - Следить за ценами на Fragment и слать выгодные находки\n"
+                "🧩 /fragment_off - Выключить мониторинг Fragment\n"
                 "🌈 /chromatic - Показать вопрос про хроматические NFT (с кнопками)\n"
                 "🌈 /chromatic_on - Ловить хроматические по флору (кроме стейкинга)\n"
                 "🌈 /chromatic_off - Не ловить хроматические\n"
@@ -393,6 +432,8 @@ class TelegramBot:
                 offers_delay_val = state["offers_delay"]
                 chromatic_status = "🟢 ВКЛ" if state["catch_chromatic"] else "🔴 ВЫКЛ"
                 chromatic_sens = state["chromatic_threshold"]
+                fragment_status = "🟢 ВКЛ" if state["watch_fragment"] else "🔴 ВЫКЛ"
+                watch_frag = state["watch_fragment"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
 
             floor_lines = []
@@ -407,19 +448,32 @@ class TelegramBot:
             floors_block = "\n".join(floor_lines)
             placed_block = "\n".join(placed_lines)
 
+            fragment_block = ""
+            if watch_frag:
+                frag_lines = []
+                for col in TARGET_COLLECTIONS:
+                    ffval = fragment_floors.get(col)
+                    frag_str = f"{ffval:.0f} TON" if ffval else "Нет данных"
+                    frag_lines.append(f"• {col}: <code>{frag_str}</code>")
+                fragment_block = (
+                    "🧩 <b>Флор на Fragment:</b>\n" + "\n".join(frag_lines) + "\n\n"
+                )
+
             status_text = (
                 f"📊 <b>Текущий статус снайпера:</b>\n"
                 f"• Режим работы: <b>{running_status}</b>\n"
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
+                f"• 🧩 Мониторинг Fragment: <b>{fragment_status}</b>\n"
                 f"• 🌈 Ловить хроматические: <b>{chromatic_status}</b> (чувствит.: {chromatic_sens})\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
-                f"📈 <b>Рыночный флор:</b>\n"
+                f"📈 <b>Рыночный флор (MRKT):</b>\n"
                 f"{floors_block}\n\n"
+                f"{fragment_block}"
                 f"✉️ <b>Последние выставленные офферы:</b>\n"
                 f"{placed_block}\n\n"
                 f"⚙️ <b>Статистика:</b>\n"
@@ -542,6 +596,26 @@ class TelegramBot:
             save_config()
             self.send_message("🛑 <b>Авто-офферы выключены.</b>")
             log("Auto-offers mode DISABLED via Telegram command.")
+
+        elif cmd == "/fragment_on":
+            with state_lock:
+                state["watch_fragment"] = True
+            save_config()
+            self.send_message(
+                "🧩 <b>Мониторинг Fragment включён!</b>\n\n"
+                "Бот будет следить за флор-ценами этих коллекций на <b>fragment.com</b> "
+                "и пришлёт уведомление со ссылкой, если там дешевле, чем на MRKT.\n\n"
+                "⚠️ <b>Важно:</b> покупка на Fragment делается вручную через TON-кошелёк. "
+                "Автоматически купить там бот не может — только следит и подсказывает."
+            )
+            log("Fragment monitoring ENABLED via Telegram command.")
+
+        elif cmd == "/fragment_off":
+            with state_lock:
+                state["watch_fragment"] = False
+            save_config()
+            self.send_message("🛑 <b>Мониторинг Fragment выключен.</b>")
+            log("Fragment monitoring DISABLED via Telegram command.")
 
         elif cmd == "/chromatic":
             self.ask_chromatic_question()
@@ -905,6 +979,91 @@ def calculate_stable_floor(listings):
 # BACKGROUND THREADS
 # =====================================================================
 
+# =====================================================================
+# FRAGMENT (fragment.com) — read-only floor monitoring
+# =====================================================================
+def fragment_listing_url(collection_name):
+    """Public Fragment URL listing a collection's on-sale gifts, cheapest first."""
+    slug = FRAGMENT_SLUGS.get(collection_name)
+    if not slug:
+        return None
+    return f"{FRAGMENT_BASE_URL}/gifts/{slug}?sort=price&filter=sale"
+
+
+def fetch_fragment_floor(collection_name, timeout=8):
+    """
+    Reads the cheapest on-sale price (floor, in TON) for a collection on Fragment.
+
+    Fragment has no public API and no MRKT-style token: we read its public
+    listing page and parse the TON price values. Returns float TON or None.
+    Never raises — failures are logged and return None so the caller keeps running.
+    """
+    url = fragment_listing_url(collection_name)
+    if not url:
+        return None
+    try:
+        # Use the raw session WITHOUT MRKT auth headers — Fragment is a separate site.
+        r = session.session.get(url, headers=FRAGMENT_HEADERS, timeout=timeout)
+    except Exception as e:
+        log(f"[Fragment] Request error for '{collection_name}': {e}", "WARN")
+        return None
+    if r is None or getattr(r, "status_code", None) != 200:
+        log(f"[Fragment] HTTP {getattr(r, 'status_code', 'no-response')} for '{collection_name}'", "WARN")
+        return None
+    prices = []
+    for raw in FRAGMENT_PRICE_RE.findall(r.text):
+        try:
+            prices.append(float(raw.replace(",", "")))
+        except ValueError:
+            continue
+    if not prices:
+        return None
+    return min(prices)
+
+
+def check_fragment_floors():
+    """
+    Refreshes Fragment floors for all collections and alerts when Fragment is
+    cheaper than the MRKT stable floor by at least the configured margin.
+    Called from the floor analyzer thread when /fragment_on is enabled.
+    """
+    summary = []
+    with state_lock:
+        margin = state["margin"]
+    for col in TARGET_COLLECTIONS:
+        try:
+            f_floor = fetch_fragment_floor(col)
+            with state_lock:
+                fragment_floors[col] = f_floor
+            if f_floor is None:
+                summary.append(f"{col}=Нет лотов")
+                continue
+            summary.append(f"{col}={f_floor:.0f}")
+
+            with state_lock:
+                mrkt_floor = stable_floors.get(col)
+            # A deal = Fragment floor is at least `margin` TON below the MRKT floor.
+            if mrkt_floor and f_floor <= (mrkt_floor - margin):
+                if fragment_alerted.get(col) != f_floor:
+                    fragment_alerted[col] = f_floor
+                    saving = mrkt_floor - f_floor
+                    tg_bot.send_message(
+                        f"🧩 <b>Дешевле на Fragment!</b>\n\n"
+                        f"Коллекция: <b>{col}</b>\n"
+                        f"• Fragment флор: <b>{f_floor:.0f} TON</b>\n"
+                        f"• MRKT флор: <code>{mrkt_floor:.2f} TON</code>\n"
+                        f"• Выгода: <b>{saving:.2f} TON</b>\n\n"
+                        f"🔗 <a href=\"{fragment_listing_url(col)}\">Открыть на Fragment</a>\n"
+                        f"⚠️ Покупка на Fragment — вручную через TON-кошелёк (бот туда купить не может)."
+                    )
+                    stats["alerts"] += 1
+        except Exception as e:
+            log(f"[Fragment] Monitor error for '{col}': {e}", "ERROR")
+            stats["errors"] += 1
+    if summary:
+        log("Fragment floors: " + "  ".join(summary))
+
+
 def floor_analyzer_loop():
     """
     Refreshes stable floor cache every 60 seconds (was 6 minutes).
@@ -928,6 +1087,16 @@ def floor_analyzer_loop():
             state["last_analysis_time"] = datetime.now()
         if summary:
             log("Floors updated: " + "  ".join(summary))
+
+        # Fragment monitoring (read-only) runs on the same slow cycle so it
+        # never slows down the fast MRKT sniper loop.
+        with state_lock:
+            watch_frag = state["watch_fragment"]
+        if watch_frag:
+            try:
+                check_fragment_floors()
+            except Exception as e:
+                log(f"[Fragment] check_fragment_floors failed: {e}", "ERROR")
 
         time.sleep(60)  # refresh every 60s — was 360s
 
@@ -1295,6 +1464,7 @@ def main():
         "🤖 <b>MRKT Sniper Bot успешно запущен!</b>\n"
         "• Снайпер работает в фоновом режиме.\n"
         "• Авто-офферы: выключены (включить: /offers_on)\n"
+        "• Мониторинг Fragment: выключен (включить: /fragment_on)\n"
         "• Отправьте /status для проверки текущего состояния и цен."
     )
 
