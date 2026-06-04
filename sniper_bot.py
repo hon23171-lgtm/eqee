@@ -53,7 +53,7 @@ state = {
     "tg_bot_token": "",
     "tg_chat_id": "",
     "margin": 0.2,        # in TON — used both for sniper profit and offer discount below floor
-    "delay": 1.5,         # Fast polling interval in seconds
+    "delay": 0.4,         # Fast polling interval in seconds (turbo default)
     "sniper_mode": "buy", # "buy" (auto-buy + alert) or "alert" (only alert)
     "running": True,
     "offers_running": False,  # Auto-offers mode flag
@@ -109,7 +109,7 @@ def load_config():
                 state["tg_bot_token"] = cfg.get("tg_bot_token", "")
                 state["tg_chat_id"] = cfg.get("tg_chat_id", "")
                 state["margin"] = float(cfg.get("margin", 0.2))
-                state["delay"] = float(cfg.get("delay", 1.5))
+                state["delay"] = float(cfg.get("delay", 0.4))
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
                 state["catch_chromatic"] = bool(cfg.get("catch_chromatic", False))
                 state["chromatic_threshold"] = float(cfg.get("chromatic_threshold", 60.0))
@@ -678,7 +678,7 @@ def fetch_listings(collection_name, count=10):
             raise Exception(f"API_ERROR_{r.status_code}")
     raise Exception("API_CONNECTION_FAILED")
 
-def fetch_combined_listings(collections, count=15):
+def fetch_combined_listings(collections, count=15, timeout=8):
     url = f"{API_BASE_URL}/gifts/saling"
     payload = {
         "collectionNames": collections,
@@ -696,7 +696,7 @@ def fetch_combined_listings(collections, count=15):
         "query": None,
         "promotedFirst": False
     }
-    r = session.post(url, payload)
+    r = session.post(url, payload, timeout=timeout)
     if r is not None:
         if r.status_code == 200:
             return r.json().get("gifts", [])
@@ -989,7 +989,7 @@ def sniper_loop():
       ✅  Minimal sleep between cycles
     """
     log("TURBO sniper loop started.")
-    current_sleep = 1.5
+    current_sleep = 0.4
 
     while True:
         with state_lock:
@@ -1012,9 +1012,10 @@ def sniper_loop():
                 state["running"] = False
             continue
 
+        cycle_start = time.monotonic()
         try:
             # Combined query (only 1 request to check both target collections)
-            gifts = fetch_combined_listings(["Vice Cream", "Chill Flame"], count=15)
+            gifts = fetch_combined_listings(["Vice Cream", "Chill Flame"], count=15, timeout=5)
             stats["scans"] += len(gifts)
             
             # Reset backoff counters on success
@@ -1120,8 +1121,8 @@ def sniper_loop():
                     state["consecutive_429"] = min(10, state["consecutive_429"] + 1)
                     mult = state["consecutive_429"]
                 
-                # Apply exponential backoff
-                current_sleep = min(12.0, poll_delay * (1.5 ** mult))
+                # Apply exponential backoff (capped lower so we recover fast)
+                current_sleep = min(8.0, poll_delay * (1.5 ** mult))
                 log(f"Encountered API 429 rate limit. Backing off for {current_sleep:.2f} seconds...", "WARN")
             elif "API_401_UNAUTHORIZED" in err_str:
                 stats["errors"] += 1
@@ -1133,7 +1134,12 @@ def sniper_loop():
                 stats["errors"] += 1
                 log(f"Sniper loop error: {e}", "ERROR")
 
-        time.sleep(current_sleep)
+        # Subtract the time already spent this cycle so the real poll cadence
+        # matches `current_sleep` instead of (request_time + current_sleep).
+        elapsed = time.monotonic() - cycle_start
+        remaining = current_sleep - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
 # =====================================================================
 # AUTO-OFFERS LOOP
