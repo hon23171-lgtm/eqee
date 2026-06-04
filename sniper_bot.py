@@ -60,6 +60,8 @@ state = {
     "offers_delay": 30.0,     # Seconds between offer re-check cycles
     "last_analysis_time": None,
     "consecutive_429": 0,
+    "catch_chromatic": False,     # If True: also catch "chromatic" gifts at floor-or-below price
+    "chromatic_threshold": 60.0,  # Max RGB color distance to treat a gift as chromatic
 }
 
 # Calculated market floor prices
@@ -109,6 +111,8 @@ def load_config():
                 state["margin"] = float(cfg.get("margin", 0.2))
                 state["delay"] = float(cfg.get("delay", 1.5))
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
+                state["catch_chromatic"] = bool(cfg.get("catch_chromatic", False))
+                state["chromatic_threshold"] = float(cfg.get("chromatic_threshold", 60.0))
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -141,7 +145,9 @@ def save_config():
             "margin": state["margin"],
             "delay": state["delay"],
             "offers_delay": state["offers_delay"],
-            "sniper_mode": state["sniper_mode"]
+            "sniper_mode": state["sniper_mode"],
+            "catch_chromatic": state["catch_chromatic"],
+            "chromatic_threshold": state["chromatic_threshold"]
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -257,6 +263,78 @@ class TelegramBot:
         except Exception:
             self.send_message(caption, parse_mode)
 
+    def send_message_with_keyboard(self, text, keyboard, parse_mode="HTML"):
+        """Send a message with an inline keyboard (list of button rows)."""
+        with state_lock:
+            token = state["tg_bot_token"]
+            chat_id = state["tg_chat_id"]
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "reply_markup": {"inline_keyboard": keyboard}
+        }
+        try:
+            r = session.session.post(url, json=payload, timeout=8)
+            if r.status_code != 200:
+                log(f"Telegram keyboard send failed: {r.status_code} {r.text}", "WARN")
+        except Exception as e:
+            log(f"Telegram keyboard send error: {e}", "ERROR")
+
+    def answer_callback(self, callback_id, text=""):
+        with state_lock:
+            token = state["tg_bot_token"]
+        if not token:
+            return
+        url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+        try:
+            session.session.post(url, json={"callback_query_id": callback_id, "text": text}, timeout=8)
+        except Exception:
+            pass
+
+    def ask_chromatic_question(self):
+        """Send the startup popup asking whether to also catch chromatic NFTs."""
+        with state_lock:
+            enabled = state["catch_chromatic"]
+        current = "включено ✅" if enabled else "выключено ❌"
+        text = (
+            "🌈 <b>Ловить хроматические NFT?</b>\n\n"
+            "Хроматические — это подарки, у которых символ/мелкие детали того же цвета, "
+            "что и фон (сливаются с фоном).\n\n"
+            "Если включить, бот будет ловить их <b>по флор-цене или ниже</b>.\n"
+            "🛡 Хроматические, которые находятся <b>в стейкинге</b>, бот <b>никогда</b> не ловит.\n\n"
+            f"Сейчас: <b>{current}</b>"
+        )
+        keyboard = [[
+            {"text": "✅ Да, ловить", "callback_data": "chromatic_yes"},
+            {"text": "❌ Нет", "callback_data": "chromatic_no"},
+        ]]
+        self.send_message_with_keyboard(text, keyboard)
+
+    def handle_callback(self, data, callback_id, chat_id):
+        with state_lock:
+            if not state["tg_chat_id"] or state["tg_chat_id"] != str(chat_id):
+                state["tg_chat_id"] = str(chat_id)
+                threading.Thread(target=save_config, daemon=True).start()
+
+        if data == "chromatic_yes":
+            with state_lock:
+                state["catch_chromatic"] = True
+            save_config()
+            self.answer_callback(callback_id, "Хроматические включены")
+            self.send_message("✅ <b>Ловля хроматических включена.</b> Бот будет ловить их по флор-цене или ниже (кроме тех, что в стейкинге).")
+        elif data == "chromatic_no":
+            with state_lock:
+                state["catch_chromatic"] = False
+            save_config()
+            self.answer_callback(callback_id, "Хроматические выключены")
+            self.send_message("❌ <b>Ловля хроматических выключена.</b> Бот ловит только обычные дешёвые лоты.")
+        else:
+            self.answer_callback(callback_id)
+
     def handle_command(self, cmd, args, chat_id):
         # Update chat_id in state if it's new
         with state_lock:
@@ -281,6 +359,10 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
+                "🌈 /chromatic - Показать вопрос про хроматические NFT (с кнопками)\n"
+                "🌈 /chromatic_on - Ловить хроматические по флору (кроме стейкинга)\n"
+                "🌈 /chromatic_off - Не ловить хроматические\n"
+                "🎚 /chromatic_sens &lt;число&gt; - Чувствительность определения хроматических (по умолч. 60)\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -298,6 +380,8 @@ class TelegramBot:
                 margin_val = state["margin"]
                 delay_val = state["delay"]
                 offers_delay_val = state["offers_delay"]
+                chromatic_status = "🟢 ВКЛ" if state["catch_chromatic"] else "🔴 ВЫКЛ"
+                chromatic_sens = state["chromatic_threshold"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
 
             floor_vc = f"{stable_floors['Vice Cream']:.2f} TON" if stable_floors['Vice Cream'] else "Не определен"
@@ -311,6 +395,7 @@ class TelegramBot:
                 f"• Режим работы: <b>{running_status}</b>\n"
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
+                f"• 🌈 Ловить хроматические: <b>{chromatic_status}</b> (чувствит.: {chromatic_sens})\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
@@ -443,6 +528,39 @@ class TelegramBot:
             self.send_message("🛑 <b>Авто-офферы выключены.</b>")
             log("Auto-offers mode DISABLED via Telegram command.")
 
+        elif cmd == "/chromatic":
+            self.ask_chromatic_question()
+
+        elif cmd == "/chromatic_on":
+            with state_lock:
+                state["catch_chromatic"] = True
+            save_config()
+            self.send_message("✅ <b>Ловля хроматических включена.</b> Бот будет ловить их по флор-цене или ниже (кроме тех, что в стейкинге).")
+            log("Chromatic catching ENABLED via Telegram command.")
+
+        elif cmd == "/chromatic_off":
+            with state_lock:
+                state["catch_chromatic"] = False
+            save_config()
+            self.send_message("❌ <b>Ловля хроматических выключена.</b>")
+            log("Chromatic catching DISABLED via Telegram command.")
+
+        elif cmd == "/chromatic_sens":
+            if not args:
+                self.send_message("❌ Укажите число. Пример: <code>/chromatic_sens 60</code>\nЧем больше число — тем больше подарков считается хроматическими.")
+                return
+            try:
+                val = float(args[0])
+                if val < 0:
+                    self.send_message("❌ Число не может быть отрицательным.")
+                    return
+                with state_lock:
+                    state["chromatic_threshold"] = val
+                save_config()
+                self.send_message(f"✅ Чувствительность определения хроматических изменена на <b>{val}</b>.")
+            except ValueError:
+                self.send_message("❌ Неверный формат числа.")
+
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
             threading.Thread(target=self._run_market_test, daemon=True).start()
@@ -500,6 +618,17 @@ class TelegramBot:
                                 log(f"[Telegram] Processing {len(updates)} updates")
                             for update in updates:
                                 self.offset = update["update_id"] + 1
+
+                                # Inline keyboard button presses (e.g. chromatic Yes/No)
+                                callback = update.get("callback_query")
+                                if callback:
+                                    cb_data = callback.get("data", "")
+                                    cb_id = callback.get("id")
+                                    cb_chat = callback.get("message", {}).get("chat", {}).get("id")
+                                    log(f"[Telegram] Callback pressed: {cb_data}")
+                                    self.handle_callback(cb_data, cb_id, cb_chat)
+                                    continue
+
                                 message = update.get("message")
                                 if message and "text" in message:
                                     text = message["text"].strip()
@@ -693,6 +822,46 @@ def fetch_true_floor(collection_name, count=6):
     return prices[0] if prices else None
 
 # =====================================================================
+# CHROMATIC DETECTION
+# =====================================================================
+def _unpack_rgb(color_int):
+    """Convert a packed 0xRRGGBB integer into an (r, g, b) tuple."""
+    c = int(color_int)
+    return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+
+def _color_distance(c1, c2):
+    """Euclidean distance between two packed RGB color integers."""
+    r1, g1, b1 = _unpack_rgb(c1)
+    r2, g2, b2 = _unpack_rgb(c2)
+    return ((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) ** 0.5
+
+def is_chromatic(gift, threshold=None):
+    """
+    A gift is "chromatic" when its symbol/pattern color blends into the
+    backdrop — i.e. the small details are (nearly) the same color as the
+    background. We detect this by measuring how close the backdrop symbol
+    color is to the backdrop center/edge color; if within `threshold`
+    (RGB Euclidean distance) on either, we treat it as chromatic.
+    Returns False if the color data is missing (fail-safe: treat as normal).
+    """
+    if threshold is None:
+        with state_lock:
+            threshold = state["chromatic_threshold"]
+
+    symbol_c = gift.get("backdropColorsSymbolColor")
+    center_c = gift.get("backdropColorsCenterColor")
+    edge_c   = gift.get("backdropColorsEdgeColor")
+    if symbol_c is None or (center_c is None and edge_c is None):
+        return False
+
+    distances = []
+    if center_c is not None:
+        distances.append(_color_distance(symbol_c, center_c))
+    if edge_c is not None:
+        distances.append(_color_distance(symbol_c, edge_c))
+    return min(distances) <= threshold
+
+# =====================================================================
 # CRASH-PROOF FLOOR CALCULATION ALGORITHM
 # =====================================================================
 def calculate_stable_floor(listings):
@@ -824,11 +993,13 @@ def sniper_loop():
 
     while True:
         with state_lock:
-            is_running   = state["running"]
-            margin_limit = state["margin"]
-            poll_delay   = state["delay"]
-            sniper_mode  = state["sniper_mode"]
-            token        = state["auth_token"]
+            is_running    = state["running"]
+            margin_limit  = state["margin"]
+            poll_delay    = state["delay"]
+            sniper_mode   = state["sniper_mode"]
+            token         = state["auth_token"]
+            catch_chroma  = state["catch_chromatic"]
+            chroma_thresh = state["chromatic_threshold"]
 
         if not is_running:
             time.sleep(2.0)
@@ -881,8 +1052,24 @@ def sniper_loop():
                 price_ton = float(gift.get("salePrice", 0)) / 1e9
                 real_profit = cached_floor - price_ton
 
-                # Final safety check: must be profitable against cached calculated floor
-                if real_profit >= margin_limit:
+                # Classify the gift: chromatic items (symbol color blends into
+                # the backdrop) are handled separately from normal listings.
+                chromatic = is_chromatic(gift, chroma_thresh)
+
+                if chromatic:
+                    # Hard rule: NEVER catch a chromatic gift that is in staking.
+                    if gift.get("staked"):
+                        continue
+                    # Chromatic gifts are only caught when the user opted in.
+                    if not catch_chroma:
+                        continue
+                    # Opted in: catch chromatic at floor price or below.
+                    should_snipe = price_ton <= cached_floor + 1e-9
+                else:
+                    # Normal listings: catch only when clearly below the floor.
+                    should_snipe = real_profit >= margin_limit
+
+                if should_snipe:
                     # Prevent duplicate buy actions immediately
                     add_alerted_id(gift_id)
                     
@@ -893,9 +1080,12 @@ def sniper_loop():
                     
                     # Generate Telegram startapp one-click purchase link
                     purchase_url = f"https://t.me/mrkt/app?startapp={gift_id}"
-                    
+
+                    chroma_tag = " [ХРОМАТИЧЕСКИЙ]" if chromatic else ""
+                    chroma_line = "• 🌈 <b>Хроматический NFT</b>\n" if chromatic else ""
+
                     if sniper_mode == "buy":
-                        log(f"💥 SNIPING DEAL: Spawning TURBO buy thread for {gift_name} for {price_ton:.2f} TON (Cached Floor: {cached_floor:.2f} TON, Profit: {real_profit:.2f} TON)!")
+                        log(f"💥 SNIPING DEAL{chroma_tag}: Spawning TURBO buy thread for {gift_name} for {price_ton:.2f} TON (Cached Floor: {cached_floor:.2f} TON, Profit: {real_profit:.2f} TON)!")
                         # Spawn background thread to buy immediately
                         threading.Thread(
                             target=_turbo_buy_worker,
@@ -905,10 +1095,11 @@ def sniper_loop():
                     else:
                         # Alert-only mode
                         stats["alerts"] += 1
-                        log(f"🔔 ALERT: Found cheap {gift_name} at {price_ton:.2f} TON (Cached Floor: {cached_floor:.2f} TON, Profit: {real_profit:.2f} TON)!")
-                        
+                        log(f"🔔 ALERT{chroma_tag}: Found cheap {gift_name} at {price_ton:.2f} TON (Cached Floor: {cached_floor:.2f} TON, Profit: {real_profit:.2f} TON)!")
+
                         caption = (
                             f"🎁 <b>НАЙДЕН ДЕШЕВЫЙ ПОДАРК НА MRKT!</b>\n\n"
+                            f"{chroma_line}"
                             f"• Коллекция: <b>{col_name}</b>\n"
                             f"• Подарок: <b>{gift_name}</b>\n"
                             f"• Цена покупки: <code>{price_ton:.2f} TON</code>\n"
@@ -1096,6 +1287,9 @@ def main():
         "• Авто-офферы: выключены (включить: /offers_on)\n"
         "• Отправьте /status для проверки текущего состояния и цен."
     )
+
+    # Ask the user whether to also catch chromatic NFTs (popup with buttons)
+    tg_bot.ask_chromatic_question()
 
     # 3. Keep main thread alive
     try:
