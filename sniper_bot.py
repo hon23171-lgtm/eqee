@@ -31,6 +31,18 @@ except Exception:
 # CONSTANTS & CONFIGURATION
 # =====================================================================
 API_BASE_URL = "https://api.tgmrkt.io/api/v1"
+
+# Collections the bot watches for sniping, floor analysis, and auto-offers.
+TARGET_COLLECTIONS = [
+    "Vice Cream",
+    "Chill Flame",
+    "Pet Snake",
+    "Lol Pop",
+    "Mood Pack",
+    "Pool Float",
+    "Big Year",
+]
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 ALERTED_FILE = os.path.join(SCRIPT_DIR, "alerted_ids.json")
@@ -64,10 +76,7 @@ state = {
 
 # Calculated market floor prices
 # Calculated as the median of the 2nd, 3rd, and 4th cheapest items to prevent outliers from skewing
-stable_floors = {
-    "Vice Cream": None,
-    "Chill Flame": None
-}
+stable_floors = {name: None for name in TARGET_COLLECTIONS}
 
 # Cache of already placed offers: {collection_name: placed_price_ton}
 # Used to skip re-placing an offer if the price hasn't changed significantly
@@ -266,9 +275,10 @@ class TelegramBot:
 
         cmd = cmd.lower()
         if cmd == "/start" or cmd == "/help":
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
             help_text = (
                 "🤖 <b>MRKT Sniper Bot</b>\n\n"
-                "Снайпер запущен и готов к работе. Настройки коллекции: <b>Vice Cream</b> и <b>Chill Flame</b>.\n\n"
+                f"Снайпер запущен и готов к работе. Отслеживаемые коллекции: {collections_str}.\n\n"
                 "<b>Доступные команды:</b>\n"
                 "📊 /status - Проверить текущий статус и флор-цены\n"
                 "💰 /margin &lt;число&gt; - Установить мин. профит / скидку оффера в TON (например: <code>/margin 0.2</code>)\n"
@@ -300,11 +310,19 @@ class TelegramBot:
                 offers_delay_val = state["offers_delay"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
 
-            floor_vc = f"{stable_floors['Vice Cream']:.2f} TON" if stable_floors['Vice Cream'] else "Не определен"
-            floor_cf = f"{stable_floors['Chill Flame']:.2f} TON" if stable_floors['Chill Flame'] else "Не определен"
+            floor_lines = []
+            offer_lines = []
+            for c in TARGET_COLLECTIONS:
+                floor_val = stable_floors.get(c)
+                floor_str = f"{floor_val:.2f} TON" if floor_val else "Не определен"
+                floor_lines.append(f"• {c}: <b>{floor_str}</b>")
 
-            placed_vc = f"{placed_offers.get('Vice Cream', 0):.2f} TON" if placed_offers.get('Vice Cream') else "—"
-            placed_cf = f"{placed_offers.get('Chill Flame', 0):.2f} TON" if placed_offers.get('Chill Flame') else "—"
+                placed_val = placed_offers.get(c)
+                placed_str = f"{placed_val:.2f} TON" if placed_val else "—"
+                offer_lines.append(f"• {c}: <code>{placed_str}</code>")
+
+            floors_block = "\n".join(floor_lines)
+            offers_block = "\n".join(offer_lines)
 
             status_text = (
                 f"📊 <b>Текущий статус снайпера:</b>\n"
@@ -316,12 +334,10 @@ class TelegramBot:
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
-                f"📈 <b>Рыночный флор (анализ 6 минут):</b>\n"
-                f"• Vice Cream: <b>{floor_vc}</b>\n"
-                f"• Chill Flame: <b>{floor_cf}</b>\n\n"
+                f"📈 <b>Рыночный флор:</b>\n"
+                f"{floors_block}\n\n"
                 f"✉️ <b>Последние выставленные офферы:</b>\n"
-                f"• Vice Cream: <code>{placed_vc}</code>\n"
-                f"• Chill Flame: <code>{placed_cf}</code>\n\n"
+                f"{offers_block}\n\n"
                 f"⚙️ <b>Статистика:</b>\n"
                 f"• Проверено лотов: <code>{stats['scans']}</code>\n"
                 f"• Успешных покупок: <code>{stats['buys']}</code>\n"
@@ -427,9 +443,10 @@ class TelegramBot:
             save_config()
             with state_lock:
                 margin_v = state["margin"]
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
             self.send_message(
                 f"✅ <b>Авто-офферы включены!</b>\n"
-                f"Бот будет выставлять офферы на <b>Vice Cream</b> и <b>Chill Flame</b>\n"
+                f"Бот будет выставлять офферы на {collections_str}\n"
                 f"ниже рыночного флора на <b>{margin_v} TON</b>.\n"
                 f"Защита от скама активна — оффер всегда ставится относительно реального флора, "
                 f"а не цены отдельного листинга."
@@ -449,28 +466,22 @@ class TelegramBot:
 
     def _run_market_test(self):
         try:
-            vc_listings = fetch_listings("Vice Cream", count=10)
-            cf_listings = fetch_listings("Chill Flame", count=10)
-            
-            vc_floor = calculate_stable_floor(vc_listings)
-            cf_floor = calculate_stable_floor(cf_listings)
-            
-            vc_floor_str = f"<b>{vc_floor:.2f} TON</b>" if vc_floor else "Не найдено лотов"
-            cf_floor_str = f"<b>{cf_floor:.2f} TON</b>" if cf_floor else "Не найдено лотов"
-            
-            # Print cheap listing preview
-            vc_cheapest = f"{float(vc_listings[0]['salePrice'])/1e9:.2f} TON" if vc_listings else "Нет"
-            cf_cheapest = f"{float(cf_listings[0]['salePrice'])/1e9:.2f} TON" if cf_listings else "Нет"
-            
+            blocks = []
+            for col in TARGET_COLLECTIONS:
+                listings = fetch_listings(col, count=10)
+                floor = calculate_stable_floor(listings)
+                floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
+                cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
+                blocks.append(
+                    f"<b>{col}:</b>\n"
+                    f"• Стабильный флор: {floor_str}\n"
+                    f"• Самый дешевый лот: <code>{cheapest}</code>"
+                )
+
             res_text = (
-                f"🧪 <b>Результаты быстрого анализа:</b>\n\n"
-                f"🍦 <b>Vice Cream:</b>\n"
-                f"• Стабильный флор: {vc_floor_str}\n"
-                f"• Самый дешевый лот: <code>{vc_cheapest}</code>\n\n"
-                f"🔥 <b>Chill Flame:</b>\n"
-                f"• Стабильный флор: {cf_floor_str}\n"
-                f"• Самый дешевый лот: <code>{cf_cheapest}</code>\n\n"
-                f"🔌 <i>Соединение с MRKT API работает корректно!</i>"
+                "🧪 <b>Результаты быстрого анализа:</b>\n\n"
+                + "\n\n".join(blocks)
+                + "\n\n🔌 <i>Соединение с MRKT API работает корректно!</i>"
             )
             self.send_message(res_text)
         except Exception as e:
@@ -736,20 +747,21 @@ def floor_analyzer_loop():
     log("Floor analyzer started (60s refresh cycle).")
     while True:
         try:
-            vc_listings = fetch_listings("Vice Cream", count=10)
-            vc_floor    = calculate_stable_floor(vc_listings)
-
-            cf_listings = fetch_listings("Chill Flame", count=10)
-            cf_floor    = calculate_stable_floor(cf_listings)
+            computed = {}
+            for col in TARGET_COLLECTIONS:
+                listings = fetch_listings(col, count=10)
+                computed[col] = calculate_stable_floor(listings)
 
             with state_lock:
-                stable_floors["Vice Cream"]  = vc_floor
-                stable_floors["Chill Flame"] = cf_floor
-                state["last_analysis_time"]  = datetime.now()
+                for col, floor in computed.items():
+                    stable_floors[col] = floor
+                state["last_analysis_time"] = datetime.now()
 
-            vc_str = f"{vc_floor:.3f} TON" if vc_floor else "Нет лотов"
-            cf_str = f"{cf_floor:.3f} TON" if cf_floor else "Нет лотов"
-            log(f"Floors updated: Vice Cream={vc_str}  Chill Flame={cf_str}")
+            summary = "  ".join(
+                f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                for col, floor in computed.items()
+            )
+            log(f"Floors updated: {summary}")
 
         except Exception as e:
             log(f"Floor analyzer error: {e}", "ERROR")
@@ -842,8 +854,8 @@ def sniper_loop():
             continue
 
         try:
-            # Combined query (only 1 request to check both target collections)
-            gifts = fetch_combined_listings(["Vice Cream", "Chill Flame"], count=15)
+            # Combined query (only 1 request to check all target collections)
+            gifts = fetch_combined_listings(TARGET_COLLECTIONS, count=30)
             stats["scans"] += len(gifts)
             
             # Reset backoff counters on success
@@ -869,7 +881,7 @@ def sniper_loop():
                     continue
 
                 col_name = gift.get("collectionName")
-                if col_name not in ["Vice Cream", "Chill Flame"]:
+                if col_name not in TARGET_COLLECTIONS:
                     continue
 
                 # Get cached stable floor
@@ -962,7 +974,6 @@ def offers_loop():
     - Offers are skipped if the price hasn't shifted by more than 0.05 TON
       since the last placed offer (to avoid spamming the API).
     """
-    TARGET_COLLECTIONS = ["Vice Cream", "Chill Flame"]
     log("Auto-offers background loop started (PAUSED until /offers_on).")
 
     while True:
@@ -1057,7 +1068,7 @@ def offers_loop():
 def main():
     log("========================================")
     log("Starting MRKT Sniper Bot...")
-    log("Target Collections: Vice Cream, Chill Flame")
+    log(f"Target Collections: {', '.join(TARGET_COLLECTIONS)}")
     log("========================================")
 
     # 1. Load config and set initial variables
