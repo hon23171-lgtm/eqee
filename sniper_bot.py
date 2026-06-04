@@ -16,6 +16,7 @@ if sys.platform.startswith('win'):
         pass
 import threading
 import traceback
+import re
 from datetime import datetime
 import urllib.parse
 
@@ -58,6 +59,35 @@ HEADERS_TEMPLATE = {
 }
 
 # =====================================================================
+# FRAGMENT (fragment.com) CONFIGURATION
+# =====================================================================
+# Fragment is Telegram's official collectibles marketplace. It has NO public,
+# documented API: the web frontend POSTs form-encoded requests to
+# `https://fragment.com/api?hash=<hash>`, where <hash> is embedded in the page
+# HTML and rotates. Reading prices generally requires a logged-in session
+# (the `stel_token` / `stel_ssid` cookies).
+#
+# IMPORTANT — UNVERIFIED INTEGRATION POINTS (adjust after a real test run):
+#   • FRAGMENT_SEARCH_METHOD — the api `method` name for the gift marketplace.
+#   • The request payload fields below (sort/filter keys).
+#   • The response shape parsed in `_fragment_parse_listings`.
+# These are best-effort guesses based on the known shape of fragment.com/api
+# and almost certainly need tweaking once you can observe a real response.
+FRAGMENT_BASE_URL = "https://fragment.com"
+FRAGMENT_GIFTS_PAGE = "https://fragment.com/gifts"
+FRAGMENT_SEARCH_METHOD = "searchGiftsForSale"
+
+FRAGMENT_HEADERS = {
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": FRAGMENT_BASE_URL,
+    "Referer": FRAGMENT_GIFTS_PAGE,
+    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+# =====================================================================
 # GLOBAL STATE
 # =====================================================================
 state = {
@@ -72,11 +102,18 @@ state = {
     "offers_delay": 30.0,     # Seconds between offer re-check cycles
     "last_analysis_time": None,
     "consecutive_429": 0,
+    # --- Fragment (fragment.com) ---
+    "fragment_cookie": "",      # Session cookie string for fragment.com (e.g. "stel_token=...; stel_ssid=...")
+    "fragment_running": False,  # Whether the Fragment floor watcher / alert loop is active
+    "fragment_delay": 5.0,      # Polling interval (seconds) for the Fragment sniper
 }
 
 # Calculated market floor prices
 # Calculated as the median of the 2nd, 3rd, and 4th cheapest items to prevent outliers from skewing
 stable_floors = {name: None for name in TARGET_COLLECTIONS}
+
+# Calculated Fragment floor prices (same collections as MRKT, computed the same way)
+fragment_floors = {name: None for name in TARGET_COLLECTIONS}
 
 # Cache of already placed offers: {collection_name: placed_price_ton}
 # Used to skip re-placing an offer if the price hasn't changed significantly
@@ -118,6 +155,9 @@ def load_config():
                 state["margin"] = float(cfg.get("margin", 0.2))
                 state["delay"] = float(cfg.get("delay", 1.5))
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
+                state["fragment_cookie"] = cfg.get("fragment_cookie", "")
+                state["fragment_running"] = bool(cfg.get("fragment_running", False))
+                state["fragment_delay"] = float(cfg.get("fragment_delay", 5.0))
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -150,7 +190,10 @@ def save_config():
             "margin": state["margin"],
             "delay": state["delay"],
             "offers_delay": state["offers_delay"],
-            "sniper_mode": state["sniper_mode"]
+            "sniper_mode": state["sniper_mode"],
+            "fragment_cookie": state["fragment_cookie"],
+            "fragment_running": state["fragment_running"],
+            "fragment_delay": state["fragment_delay"],
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -216,6 +259,198 @@ class ImpersonatedSession:
             return None
 
 session = ImpersonatedSession()
+
+# =====================================================================
+# FRAGMENT (fragment.com) HTTP SESSION + LISTINGS
+# =====================================================================
+class FragmentSession:
+    """
+    Thin client for fragment.com's internal `/api?hash=<hash>` endpoint.
+
+    The `hash` is scraped from the gifts page HTML and cached; it is refreshed
+    automatically if a request looks unauthenticated/expired. Authentication
+    (when needed) is supplied as a raw Cookie string via config `fragment_cookie`
+    (set it with the Telegram command /fragment_token).
+
+    NOTE: This is a best-effort client for an undocumented endpoint. See the
+    UNVERIFIED INTEGRATION POINTS note near the FRAGMENT_* constants.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+        self._hash = None
+        self._hash_lock = threading.Lock()
+
+    @property
+    def session(self):
+        if not hasattr(self._local, "session"):
+            if HAS_CURL_CFFI:
+                try:
+                    self._local.session = curl_requests.Session(impersonate="chrome124")
+                except Exception:
+                    self._local.session = curl_requests.Session()
+            else:
+                self._local.session = curl_requests.Session()
+        return self._local.session
+
+    def _headers(self):
+        headers = FRAGMENT_HEADERS.copy()
+        with state_lock:
+            cookie = state["fragment_cookie"]
+        if cookie:
+            headers["Cookie"] = cookie
+        return headers
+
+    def _refresh_hash(self, force=False):
+        """Scrape the rotating api hash from the gifts page HTML."""
+        with self._hash_lock:
+            if self._hash and not force:
+                return self._hash
+            try:
+                r = self.session.get(FRAGMENT_GIFTS_PAGE, headers=self._headers(), timeout=10)
+                html = r.text if r is not None else ""
+                # Frontend bootstraps with: "apiUrl":"\/api?hash=XXXXXXXX"
+                m = re.search(r'apiUrl"\s*:\s*"\\?/api\?hash=([0-9a-fA-F]+)"', html)
+                if not m:
+                    m = re.search(r'/api\?hash=([0-9a-fA-F]+)', html)
+                if m:
+                    self._hash = m.group(1)
+                    log(f"[Fragment] API hash refreshed.")
+                else:
+                    log("[Fragment] Could not locate api hash in page HTML.", "WARN")
+            except Exception as e:
+                log(f"[Fragment] Failed to refresh api hash: {e}", "ERROR")
+            return self._hash
+
+    def api_post(self, data, timeout=10):
+        """POST form-encoded data to /api?hash=<hash>, refreshing the hash on demand."""
+        hash_val = self._refresh_hash()
+        if not hash_val:
+            raise Exception("FRAGMENT_NO_HASH")
+        url = f"{FRAGMENT_BASE_URL}/api?hash={hash_val}"
+        try:
+            r = self.session.post(url, data=data, headers=self._headers(), timeout=timeout)
+        except Exception as e:
+            log(f"[Fragment] POST exception to {url}: {e}", "ERROR")
+            return None
+        # A rotated/expired hash usually surfaces as 400/404 — refresh once and retry.
+        if r is not None and r.status_code in (400, 404):
+            hash_val = self._refresh_hash(force=True)
+            if hash_val:
+                url = f"{FRAGMENT_BASE_URL}/api?hash={hash_val}"
+                try:
+                    r = self.session.post(url, data=data, headers=self._headers(), timeout=timeout)
+                except Exception as e:
+                    log(f"[Fragment] POST retry exception: {e}", "ERROR")
+                    return None
+        return r
+
+
+fragment_session = FragmentSession()
+
+
+def _fragment_parse_listings(body):
+    """
+    Normalize a Fragment search response into the same item shape the rest of
+    the bot uses: a list of dicts with at least {"salePrice": <nanoTON int>}.
+    Prices are stored in nanoTON so the existing calculate_stable_floor() works
+    unchanged.
+
+    Handles three plausible response shapes (undocumented API — defensive):
+      1. JSON list of item dicts.
+      2. JSON dict with an items/gifts/results list.
+      3. JSON dict with an "html" string blob (Fragment commonly returns this);
+         prices are regex-extracted from the markup as a fallback.
+    """
+    def _to_items(raw_items):
+        out = []
+        for it in raw_items:
+            if not isinstance(it, dict):
+                continue
+            price_ton = None
+            # Common explicit price fields, in TON.
+            for k in ("price", "priceTon", "amount", "value"):
+                if it.get(k) is not None:
+                    try:
+                        price_ton = float(it[k])
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            # nanoTON-style fields.
+            if price_ton is None:
+                for k in ("priceNanoTONs", "amountNano", "priceNano"):
+                    if it.get(k) is not None:
+                        try:
+                            price_ton = float(it[k]) / 1e9
+                            break
+                        except (TypeError, ValueError):
+                            pass
+            if price_ton is None or price_ton <= 0:
+                continue
+            out.append({
+                "salePrice": int(price_ton * 1e9),
+                "name": it.get("name") or it.get("title"),
+                "number": it.get("number") or it.get("num"),
+                "url": it.get("url") or it.get("link"),
+            })
+        return out
+
+    if isinstance(body, list):
+        return _to_items(body)
+
+    if isinstance(body, dict):
+        for key in ("items", "gifts", "results", "listings"):
+            if isinstance(body.get(key), list):
+                items = _to_items(body[key])
+                if items:
+                    return items
+        html = body.get("html")
+        if isinstance(html, str) and html:
+            # Fallback: pull "<number> TON" amounts out of the markup.
+            prices = re.findall(r'([\d\s.,]+)\s*(?:TON|💎)', html)
+            items = []
+            for p in prices:
+                cleaned = p.replace(" ", "").replace(",", "")
+                try:
+                    val = float(cleaned)
+                except ValueError:
+                    continue
+                if val > 0:
+                    items.append({"salePrice": int(val * 1e9), "name": None, "number": None, "url": None})
+            return items
+    return []
+
+
+def fragment_fetch_listings(collection_name, count=10):
+    """
+    Fetch the cheapest `count` listings for a collection from Fragment, sorted
+    by price ascending. Returns a normalized list (see _fragment_parse_listings).
+
+    The request payload uses best-guess keys for the undocumented gift
+    marketplace endpoint and may need adjustment after a real test run.
+    """
+    payload = {
+        "method": FRAGMENT_SEARCH_METHOD,
+        "query": collection_name,
+        "filter": "sale",
+        "sort": "price_asc",
+        "limit": count,
+    }
+    r = fragment_session.api_post(payload)
+    if r is None:
+        raise Exception("FRAGMENT_CONNECTION_FAILED")
+    if r.status_code == 429:
+        raise Exception("API_429")
+    if r.status_code == 401 or r.status_code == 403:
+        raise Exception("FRAGMENT_AUTH_REQUIRED")
+    if r.status_code != 200:
+        raise Exception(f"FRAGMENT_ERROR_{r.status_code}")
+    try:
+        body = r.json()
+    except Exception:
+        raise Exception("FRAGMENT_BAD_JSON")
+    return _fragment_parse_listings(body)
+
 
 # =====================================================================
 # TELEGRAM BOT INTEGRATION (LONG POLLING)
@@ -291,6 +526,9 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
+                "🧩 /fragment_token &lt;cookie&gt; - Задать куки сессии fragment.com\n"
+                "🧩 /fragment_on - Включить мониторинг Fragment (флор + алерты)\n"
+                "🧩 /fragment_off - Выключить мониторинг Fragment\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -304,14 +542,17 @@ class TelegramBot:
             with state_lock:
                 running_status = "🟢 АКТИВЕН" if state["running"] else "🔴 ОСТАНОВЛЕН"
                 offers_status = "🟢 ВКЛЮЧЕНЫ" if state["offers_running"] else "🔴 ВЫКЛЮЧЕНЫ"
+                fragment_status = "🟢 ВКЛЮЧЕН" if state["fragment_running"] else "🔴 ВЫКЛЮЧЕН"
                 mode_str = "Выкуп + Уведомление" if state["sniper_mode"] == "buy" else "Только Уведомление"
                 margin_val = state["margin"]
                 delay_val = state["delay"]
                 offers_delay_val = state["offers_delay"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
+                fragment_auth = "Задана" if state["fragment_cookie"] else "Отсутствует"
 
             floor_lines = []
             offer_lines = []
+            fragment_floor_lines = []
             for c in TARGET_COLLECTIONS:
                 floor_val = stable_floors.get(c)
                 floor_str = f"{floor_val:.2f} TON" if floor_val else "Не определен"
@@ -321,21 +562,30 @@ class TelegramBot:
                 placed_str = f"{placed_val:.2f} TON" if placed_val else "—"
                 offer_lines.append(f"• {c}: <code>{placed_str}</code>")
 
+                frag_val = fragment_floors.get(c)
+                frag_str = f"{frag_val:.2f} TON" if frag_val else "Не определен"
+                fragment_floor_lines.append(f"• {c}: <b>{frag_str}</b>")
+
             floors_block = "\n".join(floor_lines)
             offers_block = "\n".join(offer_lines)
+            fragment_floors_block = "\n".join(fragment_floor_lines)
 
             status_text = (
                 f"📊 <b>Текущий статус снайпера:</b>\n"
                 f"• Режим работы: <b>{running_status}</b>\n"
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
+                f"• Fragment-мониторинг: <b>{fragment_status}</b>\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
+                f"• Куки Fragment: <code>{fragment_auth}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
-                f"📈 <b>Рыночный флор:</b>\n"
+                f"📈 <b>Рыночный флор (MRKT):</b>\n"
                 f"{floors_block}\n\n"
+                f"🧩 <b>Флор Fragment:</b>\n"
+                f"{fragment_floors_block}\n\n"
                 f"✉️ <b>Последние выставленные офферы:</b>\n"
                 f"{offers_block}\n\n"
                 f"⚙️ <b>Статистика:</b>\n"
@@ -460,6 +710,47 @@ class TelegramBot:
             self.send_message("🛑 <b>Авто-офферы выключены.</b>")
             log("Auto-offers mode DISABLED via Telegram command.")
 
+        elif cmd == "/fragment_token":
+            if not args:
+                self.send_message(
+                    "❌ Укажите куки сессии fragment.com. Пример:\n"
+                    "<code>/fragment_token stel_token=...; stel_ssid=...</code>"
+                )
+                return
+            # Cookie string may contain spaces (after ';'), so re-join all args.
+            new_cookie = " ".join(args).strip()
+            with state_lock:
+                state["fragment_cookie"] = new_cookie
+            save_config()
+            self.send_message("✅ Куки сессии Fragment сохранены.")
+
+        elif cmd == "/fragment_on":
+            with state_lock:
+                cookie = state["fragment_cookie"]
+            if not cookie:
+                self.send_message(
+                    "⚠️ Куки Fragment не заданы — публичные данные могут быть недоступны. "
+                    "Рекомендуется сначала задать <code>/fragment_token &lt;cookie&gt;</code>."
+                )
+            with state_lock:
+                state["fragment_running"] = True
+            save_config()
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
+            self.send_message(
+                f"✅ <b>Мониторинг Fragment включён!</b>\n"
+                f"Считаю флор и слежу за рынком на {collections_str}.\n"
+                f"⚠️ Только уведомления о дешёвых лотах — автовыкуп на Fragment "
+                f"требует подписи транзакции в TON-кошельке и не выполняется ботом."
+            )
+            log("Fragment monitoring ENABLED via Telegram command.")
+
+        elif cmd == "/fragment_off":
+            with state_lock:
+                state["fragment_running"] = False
+            save_config()
+            self.send_message("🛑 <b>Мониторинг Fragment выключен.</b>")
+            log("Fragment monitoring DISABLED via Telegram command.")
+
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
             threading.Thread(target=self._run_market_test, daemon=True).start()
@@ -479,13 +770,38 @@ class TelegramBot:
                 )
 
             res_text = (
-                "🧪 <b>Результаты быстрого анализа:</b>\n\n"
+                "🧪 <b>Результаты быстрого анализа (MRKT):</b>\n\n"
                 + "\n\n".join(blocks)
                 + "\n\n🔌 <i>Соединение с MRKT API работает корректно!</i>"
             )
             self.send_message(res_text)
         except Exception as e:
-            self.send_message(f"❌ Ошибка тестирования рынка: <code>{e}</code>")
+            self.send_message(f"❌ Ошибка тестирования рынка MRKT: <code>{e}</code>")
+
+        # Fragment test (only if enabled / cookie set) — isolated so MRKT result is unaffected.
+        with state_lock:
+            frag_enabled = state["fragment_running"] or bool(state["fragment_cookie"])
+        if frag_enabled:
+            try:
+                frag_blocks = []
+                for col in TARGET_COLLECTIONS:
+                    listings = fragment_fetch_listings(col, count=10)
+                    floor = calculate_stable_floor(listings)
+                    floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
+                    cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
+                    frag_blocks.append(
+                        f"<b>{col}:</b>\n"
+                        f"• Флор: {floor_str}\n"
+                        f"• Самый дешевый лот: <code>{cheapest}</code>"
+                    )
+                    time.sleep(0.3)
+                self.send_message(
+                    "🧩 <b>Результаты анализа Fragment:</b>\n\n"
+                    + "\n\n".join(frag_blocks)
+                    + "\n\n🔌 <i>Соединение с Fragment работает.</i>"
+                )
+            except Exception as e:
+                self.send_message(f"❌ Ошибка тестирования Fragment: <code>{e}</code>")
 
     def updates_listener_loop(self):
         log("Telegram command listener thread started.")
@@ -768,6 +1084,137 @@ def floor_analyzer_loop():
             stats["errors"] += 1
 
         time.sleep(60)  # refresh every 60s — was 360s
+
+
+# =====================================================================
+# FRAGMENT FLOOR ANALYZER + ALERT SNIPER
+# =====================================================================
+# Mirrors the MRKT sniper but for fragment.com, on the SAME collections.
+# Floor is computed with the identical calculate_stable_floor() algorithm.
+# This is ALERT-ONLY: buying a collectible on Fragment requires signing a TON
+# wallet transaction, which is out of scope for this HTTP-based bot.
+
+def fragment_floor_analyzer_loop():
+    """Refreshes the Fragment floor cache every 60s while Fragment mode is on."""
+    log("Fragment floor analyzer started (60s refresh cycle, paused until /fragment_on).")
+    while True:
+        with state_lock:
+            active = state["fragment_running"]
+        if not active:
+            time.sleep(3.0)
+            continue
+
+        try:
+            computed = {}
+            for col in TARGET_COLLECTIONS:
+                listings = fragment_fetch_listings(col, count=10)
+                computed[col] = calculate_stable_floor(listings)
+                time.sleep(0.5)  # gentle pacing between collections
+
+            with state_lock:
+                for col, floor in computed.items():
+                    fragment_floors[col] = floor
+
+            summary = "  ".join(
+                f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                for col, floor in computed.items()
+            )
+            log(f"[Fragment] Floors updated: {summary}")
+
+        except Exception as e:
+            err_str = str(e)
+            if "FRAGMENT_AUTH_REQUIRED" in err_str:
+                log("[Fragment] Auth required — set cookie via /fragment_token. Pausing Fragment mode.", "ERROR")
+                tg_bot.send_message(
+                    "❌ <b>Fragment:</b> требуется авторизация. Задайте куки сессии командой "
+                    "<code>/fragment_token &lt;cookie&gt;</code> и снова включите <code>/fragment_on</code>."
+                )
+                with state_lock:
+                    state["fragment_running"] = False
+            else:
+                log(f"[Fragment] Floor analyzer error: {e}", "ERROR")
+                stats["errors"] += 1
+
+        time.sleep(60)
+
+
+def fragment_sniper_loop():
+    """
+    Fast-polling Fragment watcher. Sends a Telegram alert when a listing is
+    priced at least `margin` TON below the cached stable floor. Alert-only.
+    """
+    log("Fragment sniper loop started (paused until /fragment_on).")
+    current_sleep = 5.0
+
+    while True:
+        with state_lock:
+            active = state["fragment_running"]
+            margin_limit = state["margin"]
+            poll_delay = state["fragment_delay"]
+
+        if not active:
+            time.sleep(3.0)
+            continue
+
+        try:
+            for col in TARGET_COLLECTIONS:
+                with state_lock:
+                    cached_floor = fragment_floors.get(col)
+                if cached_floor is None:
+                    continue
+
+                listings = fragment_fetch_listings(col, count=5)
+                stats["scans"] += len(listings)
+                current_sleep = poll_delay
+
+                for item in listings:
+                    price_ton = float(item.get("salePrice", 0)) / 1e9
+                    if price_ton <= 0:
+                        continue
+                    real_profit = cached_floor - price_ton
+                    if real_profit < margin_limit:
+                        continue
+
+                    # Deduplicate by collection+price+number so we don't re-alert the same lot.
+                    number = item.get("number") or "?"
+                    dedup_key = f"fragment:{col}:{number}:{price_ton:.4f}"
+                    with alerted_lock:
+                        seen = dedup_key in alerted_ids
+                    if seen:
+                        continue
+                    add_alerted_id(dedup_key)
+
+                    stats["alerts"] += 1
+                    name = item.get("name") or f"{col} #{number}"
+                    url = item.get("url") or FRAGMENT_GIFTS_PAGE
+                    log(f"[Fragment] 🔔 ALERT: {name} @ {price_ton:.3f} TON (floor {cached_floor:.3f}, profit {real_profit:.3f})")
+                    tg_bot.send_message(
+                        f"🧩 <b>FRAGMENT: дешёвый лот!</b>\n\n"
+                        f"• Коллекция: <b>{col}</b>\n"
+                        f"• Подарок: <b>{name}</b>\n"
+                        f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+                        f"• Флор Fragment: <code>{cached_floor:.3f} TON</code>\n"
+                        f"• 💸 Выгода: <b>~{real_profit:.3f} TON</b>\n\n"
+                        f"🔗 <a href='{url}'>Открыть на Fragment</a>"
+                    )
+
+                time.sleep(0.5)
+
+        except Exception as e:
+            err_str = str(e)
+            if "API_429" in err_str:
+                stats["errors"] += 1
+                current_sleep = min(15.0, poll_delay * 2)
+                log(f"[Fragment] 429 rate limit — backing off {current_sleep:.1f}s.", "WARN")
+            elif "FRAGMENT_AUTH_REQUIRED" in err_str:
+                log("[Fragment] Auth required — pausing Fragment mode.", "ERROR")
+                with state_lock:
+                    state["fragment_running"] = False
+            else:
+                stats["errors"] += 1
+                log(f"[Fragment] Sniper loop error: {e}", "ERROR")
+
+        time.sleep(current_sleep)
 
 
 # =====================================================================
@@ -1100,11 +1547,18 @@ def main():
     # Thread D: Auto-offers loop
     threading.Thread(target=offers_loop, daemon=True).start()
 
+    # Thread E: Fragment floor analyzer (idle until /fragment_on)
+    threading.Thread(target=fragment_floor_analyzer_loop, daemon=True).start()
+
+    # Thread F: Fragment alert sniper (idle until /fragment_on)
+    threading.Thread(target=fragment_sniper_loop, daemon=True).start()
+
     # Send startup message to registered chat ID
     tg_bot.send_message(
         "🤖 <b>MRKT Sniper Bot успешно запущен!</b>\n"
         "• Снайпер работает в фоновом режиме.\n"
         "• Авто-офферы: выключены (включить: /offers_on)\n"
+        "• Fragment-мониторинг: выключен (включить: /fragment_on)\n"
         "• Отправьте /status для проверки текущего состояния и цен."
     )
 
