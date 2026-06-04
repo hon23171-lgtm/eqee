@@ -118,12 +118,12 @@ body {
   width: 90px;
   height: 90px;
   box-shadow: inset -8px -8px 0 var(--shadow);
-  animation: float 4s ease-in-out infinite;
+  animation: float 2s ease-in-out infinite;
 }
 
 .floating-block.grass { top: 0; left: 40px; background: var(--green); }
-.floating-block.dirt { top: 100px; left: 130px; background: var(--dirt); animation-delay: 0.6s; }
-.floating-block.diamond { top: 150px; left: 10px; background: #4fd0d8; animation-delay: 1.2s; }
+.floating-block.dirt { top: 100px; left: 130px; background: var(--dirt); animation-delay: 0.3s; }
+.floating-block.diamond { top: 150px; left: 10px; background: #4fd0d8; animation-delay: 0.6s; }
 
 @keyframes float {
   0%, 100% { transform: translateY(0); }
