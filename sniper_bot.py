@@ -76,6 +76,15 @@ HEADERS_TEMPLATE = {
 FRAGMENT_BASE_URL = "https://fragment.com"
 FRAGMENT_GIFTS_PAGE = "https://fragment.com/gifts"
 FRAGMENT_SEARCH_METHOD = "searchGiftsForSale"
+# Method that asks Fragment to PREPARE a purchase. Fragment is non-custodial:
+# it should return one or more TON transaction messages (destination address,
+# amount, optional payload/stateInit) that the buyer's wallet must sign — the
+# same shape TON Connect uses. UNVERIFIED method name / response shape.
+FRAGMENT_BUY_INIT_METHOD = "initGiftBuyRequest"
+# Fee buffer (TON) added on top of the price cap when sanity-checking the total
+# value of the transaction Fragment asks us to sign. Protects against a
+# malformed/oversized transaction draining the wallet beyond the intended cap.
+FRAGMENT_TX_FEE_BUFFER_TON = 0.2
 
 FRAGMENT_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -103,9 +112,13 @@ state = {
     "last_analysis_time": None,
     "consecutive_429": 0,
     # --- Fragment (fragment.com) ---
-    "fragment_cookie": "",      # Session cookie string for fragment.com (e.g. "stel_token=...; stel_ssid=...")
+    "fragment_cookie": "",      # Session cookie / token string for fragment.com auth
     "fragment_running": False,  # Whether the Fragment floor watcher / alert loop is active
     "fragment_delay": 5.0,      # Polling interval (seconds) for the Fragment sniper
+    # --- Fragment auto-buy (signs a TON transaction with the wallet below) ---
+    "fragment_autobuy": False,        # Master switch for Fragment auto-buy (default OFF)
+    "fragment_wallet_mnemonic": "",   # 24-word seed of the buying wallet — SENSITIVE, see warnings
+    "fragment_max_buy_price": 0.0,    # Hard safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
 }
 
 # Calculated market floor prices
@@ -158,6 +171,9 @@ def load_config():
                 state["fragment_cookie"] = cfg.get("fragment_cookie", "")
                 state["fragment_running"] = bool(cfg.get("fragment_running", False))
                 state["fragment_delay"] = float(cfg.get("fragment_delay", 5.0))
+                state["fragment_autobuy"] = bool(cfg.get("fragment_autobuy", False))
+                state["fragment_wallet_mnemonic"] = cfg.get("fragment_wallet_mnemonic", "")
+                state["fragment_max_buy_price"] = float(cfg.get("fragment_max_buy_price", 0.0))
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -194,6 +210,9 @@ def save_config():
             "fragment_cookie": state["fragment_cookie"],
             "fragment_running": state["fragment_running"],
             "fragment_delay": state["fragment_delay"],
+            "fragment_autobuy": state["fragment_autobuy"],
+            "fragment_wallet_mnemonic": state["fragment_wallet_mnemonic"],
+            "fragment_max_buy_price": state["fragment_max_buy_price"],
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -389,6 +408,7 @@ def _fragment_parse_listings(body):
                 continue
             out.append({
                 "salePrice": int(price_ton * 1e9),
+                "id": it.get("id") or it.get("itemId") or it.get("giftId"),
                 "name": it.get("name") or it.get("title"),
                 "number": it.get("number") or it.get("num"),
                 "url": it.get("url") or it.get("link"),
@@ -416,7 +436,7 @@ def _fragment_parse_listings(body):
                 except ValueError:
                     continue
                 if val > 0:
-                    items.append({"salePrice": int(val * 1e9), "name": None, "number": None, "url": None})
+                    items.append({"salePrice": int(val * 1e9), "id": None, "name": None, "number": None, "url": None})
             return items
     return []
 
@@ -450,6 +470,161 @@ def fragment_fetch_listings(collection_name, count=10):
     except Exception:
         raise Exception("FRAGMENT_BAD_JSON")
     return _fragment_parse_listings(body)
+
+
+# =====================================================================
+# FRAGMENT AUTO-BUY (TON wallet transaction signing)
+# =====================================================================
+# Fragment is non-custodial: a purchase is completed by signing a TON transfer
+# with the buyer's own wallet. So auto-buy here needs the wallet's seed phrase
+# (config `fragment_wallet_mnemonic`) plus a TON SDK to sign + broadcast.
+#
+# SAFETY MODEL:
+#   • Disabled unless `fragment_autobuy` is True AND `fragment_max_buy_price` > 0.
+#   • We never INVENT a destination/amount — we sign ONLY the transaction
+#     messages Fragment returns from FRAGMENT_BUY_INIT_METHOD.
+#   • Before signing, the SUMMED outgoing value is checked against
+#     (max_buy_price + fee buffer); anything larger is refused.
+#   • The TON SDK (pytoniq) is imported lazily; if missing, auto-buy aborts
+#     cleanly and falls back to an alert (no broadcast).
+#
+# UNVERIFIED: the FRAGMENT_BUY_INIT_METHOD request/response shape. Test with a
+# cheap item and a low cap first.
+
+def _fragment_parse_tx_messages(body):
+    """
+    Extract a list of TON transaction messages from Fragment's purchase-init
+    response. Returns list of {"address": str, "amount_nano": int, "payload": str|None}.
+    Mirrors the TON Connect `sendTransaction` 'messages' array shape.
+    """
+    if not isinstance(body, dict):
+        return []
+    # TON Connect style: {"transaction": {"messages": [...]}} or {"messages": [...]}
+    container = body.get("transaction") if isinstance(body.get("transaction"), dict) else body
+    raw_msgs = container.get("messages")
+    if not isinstance(raw_msgs, list):
+        return []
+    msgs = []
+    for m in raw_msgs:
+        if not isinstance(m, dict):
+            continue
+        address = m.get("address") or m.get("to")
+        amount = m.get("amount") or m.get("value")
+        if not address or amount is None:
+            continue
+        try:
+            amount_nano = int(amount)  # TON Connect amounts are nanoTON strings
+        except (TypeError, ValueError):
+            try:
+                amount_nano = int(float(amount) * 1e9)
+            except (TypeError, ValueError):
+                continue
+        msgs.append({
+            "address": str(address),
+            "amount_nano": amount_nano,
+            "payload": m.get("payload") or m.get("body"),
+        })
+    return msgs
+
+
+def fragment_init_purchase(item):
+    """
+    Ask Fragment to prepare a purchase for `item`. Returns the list of TON
+    transaction messages to sign (see _fragment_parse_tx_messages).
+    UNVERIFIED endpoint — see notes above.
+    """
+    item_id = item.get("id") or item.get("number")
+    if not item_id:
+        raise Exception("FRAGMENT_NO_ITEM_ID")
+    payload = {"method": FRAGMENT_BUY_INIT_METHOD, "id": item_id}
+    r = fragment_session.api_post(payload)
+    if r is None:
+        raise Exception("FRAGMENT_CONNECTION_FAILED")
+    if r.status_code in (401, 403):
+        raise Exception("FRAGMENT_AUTH_REQUIRED")
+    if r.status_code != 200:
+        raise Exception(f"FRAGMENT_BUY_INIT_ERROR_{r.status_code}")
+    try:
+        body = r.json()
+    except Exception:
+        raise Exception("FRAGMENT_BAD_JSON")
+    return _fragment_parse_tx_messages(body)
+
+
+def _fragment_sign_and_send(messages, mnemonic):
+    """
+    Sign and broadcast the given TON transaction messages with the configured
+    wallet. Uses pytoniq (lazy import). Returns (success: bool, msg: str).
+    """
+    try:
+        from pytoniq import LiteBalancer, WalletV4R2  # type: ignore
+    except Exception:
+        return False, ("TON SDK не установлен. Установите: pip install pytoniq")
+
+    words = mnemonic.strip().split()
+    if len(words) not in (12, 24):
+        return False, "BAD_MNEMONIC (ожидается 12 или 24 слова)"
+
+    import asyncio
+
+    async def _run():
+        provider = LiteBalancer.from_mainnet_config(trust_level=2)
+        await provider.start_up()
+        try:
+            wallet = await WalletV4R2.from_mnemonic(provider, words)
+            for m in messages:
+                await wallet.transfer(
+                    destination=m["address"],
+                    amount=m["amount_nano"],
+                    body=m.get("payload"),
+                )
+            return True, "SUCCESS"
+        finally:
+            await provider.close_all()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as e:
+        return False, f"TON_SEND_ERROR: {e}"
+
+
+def fragment_execute_buy(item):
+    """
+    Full Fragment auto-buy flow with safety guards. Returns (success, message).
+    """
+    with state_lock:
+        autobuy = state["fragment_autobuy"]
+        mnemonic = state["fragment_wallet_mnemonic"]
+        max_price = state["fragment_max_buy_price"]
+
+    if not autobuy:
+        return False, "AUTOBUY_DISABLED"
+    if max_price <= 0:
+        return False, "NO_PRICE_CAP (установите /fragment_maxprice)"
+    if not mnemonic:
+        return False, "NO_WALLET (установите /fragment_wallet)"
+
+    price_ton = float(item.get("salePrice", 0)) / 1e9
+    if price_ton <= 0:
+        return False, "BAD_PRICE"
+    if price_ton > max_price:
+        return False, f"PRICE_ABOVE_CAP ({price_ton:.3f} > {max_price:.3f} TON)"
+
+    # Ask Fragment to build the purchase transaction.
+    messages = fragment_init_purchase(item)
+    if not messages:
+        return False, "NO_TX_FROM_FRAGMENT"
+
+    # Hard guard: total value we are about to sign must not exceed cap + fee buffer.
+    total_nano = sum(m["amount_nano"] for m in messages)
+    limit_nano = int((max_price + FRAGMENT_TX_FEE_BUFFER_TON) * 1e9)
+    if total_nano > limit_nano:
+        return False, (
+            f"TX_VALUE_OVER_LIMIT: транзакция на {total_nano/1e9:.3f} TON превышает "
+            f"лимит {limit_nano/1e9:.3f} TON — покупка отменена ради безопасности."
+        )
+
+    return _fragment_sign_and_send(messages, mnemonic)
 
 
 # =====================================================================
@@ -526,9 +701,14 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
-                "🧩 /fragment_token &lt;cookie&gt; - Задать куки сессии fragment.com\n"
+                "\n<b>🧩 Fragment (fragment.com):</b>\n"
+                "🔑 /fragment_token &lt;токен/cookie&gt; - Авторизация сессии fragment.com\n"
                 "🧩 /fragment_on - Включить мониторинг Fragment (флор + алерты)\n"
                 "🧩 /fragment_off - Выключить мониторинг Fragment\n"
+                "👛 /fragment_wallet &lt;сид-фраза&gt; - Кошелёк для автовыкупа (12/24 слова)\n"
+                "🎯 /fragment_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
+                "⚡ /fragment_autobuy_on - Включить автовыкуп Fragment\n"
+                "🛑 /fragment_autobuy_off - Выключить автовыкуп Fragment\n\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -543,6 +723,9 @@ class TelegramBot:
                 running_status = "🟢 АКТИВЕН" if state["running"] else "🔴 ОСТАНОВЛЕН"
                 offers_status = "🟢 ВКЛЮЧЕНЫ" if state["offers_running"] else "🔴 ВЫКЛЮЧЕНЫ"
                 fragment_status = "🟢 ВКЛЮЧЕН" if state["fragment_running"] else "🔴 ВЫКЛЮЧЕН"
+                fragment_autobuy_status = "🟢 ВКЛЮЧЕН" if state["fragment_autobuy"] else "🔴 ВЫКЛЮЧЕН"
+                fragment_cap = state["fragment_max_buy_price"]
+                fragment_wallet_set = "Задан" if state["fragment_wallet_mnemonic"] else "Отсутствует"
                 mode_str = "Выкуп + Уведомление" if state["sniper_mode"] == "buy" else "Только Уведомление"
                 margin_val = state["margin"]
                 delay_val = state["delay"]
@@ -576,6 +759,7 @@ class TelegramBot:
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
                 f"• Fragment-мониторинг: <b>{fragment_status}</b>\n"
+                f"• Fragment-автовыкуп: <b>{fragment_autobuy_status}</b> (лимит {fragment_cap} TON, кошелёк: {fragment_wallet_set})\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
@@ -750,6 +934,73 @@ class TelegramBot:
             save_config()
             self.send_message("🛑 <b>Мониторинг Fragment выключен.</b>")
             log("Fragment monitoring DISABLED via Telegram command.")
+
+        elif cmd == "/fragment_wallet":
+            if not args:
+                self.send_message(
+                    "❌ Укажите сид-фразу кошелька (12 или 24 слова) для автовыкупа Fragment.\n"
+                    "⚠️ <b>Внимание:</b> фраза хранится в config.json в открытом виде — "
+                    "используйте отдельный кошелёк с небольшим балансом."
+                )
+                return
+            words = args
+            if len(words) not in (12, 24):
+                self.send_message("❌ Сид-фраза должна состоять из 12 или 24 слов.")
+                return
+            with state_lock:
+                state["fragment_wallet_mnemonic"] = " ".join(words)
+            save_config()
+            self.send_message(
+                "✅ Кошелёк Fragment сохранён.\n"
+                "⚠️ Рекомендуется удалить это сообщение из чата — оно содержит сид-фразу."
+            )
+
+        elif cmd == "/fragment_maxprice":
+            if not args:
+                self.send_message("❌ Укажите макс. цену покупки в TON. Пример: <code>/fragment_maxprice 5</code>")
+                return
+            try:
+                val = float(args[0])
+                if val < 0:
+                    self.send_message("❌ Цена не может быть отрицательной.")
+                    return
+                with state_lock:
+                    state["fragment_max_buy_price"] = val
+                save_config()
+                if val == 0:
+                    self.send_message("✅ Лимит сброшен в 0 — автовыкуп Fragment не будет покупать, пока не зададите лимит > 0.")
+                else:
+                    self.send_message(f"✅ Макс. цена автовыкупа Fragment: <b>{val} TON</b>.")
+            except ValueError:
+                self.send_message("❌ Неверный формат числа.")
+
+        elif cmd == "/fragment_autobuy_on":
+            with state_lock:
+                has_wallet = bool(state["fragment_wallet_mnemonic"])
+                cap = state["fragment_max_buy_price"]
+            if not has_wallet:
+                self.send_message("❌ Сначала задайте кошелёк: <code>/fragment_wallet &lt;сид-фраза&gt;</code>.")
+                return
+            if cap <= 0:
+                self.send_message("❌ Сначала задайте лимит цены: <code>/fragment_maxprice &lt;TON&gt;</code>.")
+                return
+            with state_lock:
+                state["fragment_autobuy"] = True
+            save_config()
+            self.send_message(
+                f"⚡ <b>Автовыкуп Fragment ВКЛЮЧЁН.</b>\n"
+                f"• Лимит цены: <b>{cap} TON</b>\n"
+                f"• Бот подпишет транзакцию покупки вашим кошельком при выгодном лоте.\n"
+                f"⚠️ Эндпоинты покупки Fragment не проверены — протестируйте на дешёвом лоте с низким лимитом."
+            )
+            log("Fragment auto-buy ENABLED via Telegram command.")
+
+        elif cmd == "/fragment_autobuy_off":
+            with state_lock:
+                state["fragment_autobuy"] = False
+            save_config()
+            self.send_message("🛑 <b>Автовыкуп Fragment выключен.</b>")
+            log("Fragment auto-buy DISABLED via Telegram command.")
 
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
@@ -1138,10 +1389,44 @@ def fragment_floor_analyzer_loop():
         time.sleep(60)
 
 
+def _fragment_buy_worker(item, col, name, price_ton, cached_floor, url):
+    """Runs Fragment auto-buy in a background thread and reports the result."""
+    profit = cached_floor - price_ton
+    log(f"[Fragment] 🚀 Auto-buy attempt: {name} @ {price_ton:.3f} TON")
+    try:
+        success, msg = fragment_execute_buy(item)
+    except Exception as e:
+        success, msg = False, str(e)
+
+    if success:
+        stats["buys"] += 1
+        log(f"[Fragment] ✅ BOUGHT: {name} @ {price_ton:.3f} TON")
+        tg_bot.send_message(
+            f"🎉 <b>FRAGMENT: УСПЕШНЫЙ АВТОВЫКУП!</b>\n\n"
+            f"• Коллекция: <b>{col}</b>\n"
+            f"• Подарок: <b>{name}</b>\n"
+            f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+            f"• Флор Fragment: <code>{cached_floor:.3f} TON</code>\n"
+            f"• 💰 Прибыль: <b>~{profit:.3f} TON</b>\n\n"
+            f"🔗 <a href='{url}'>Открыть на Fragment</a>"
+        )
+    else:
+        stats["errors"] += 1
+        log(f"[Fragment] ❌ Auto-buy failed: {name} | {msg}", "ERROR")
+        tg_bot.send_message(
+            f"🚨 <b>FRAGMENT: автовыкуп не удался</b>\n\n"
+            f"• Подарок: <b>{name}</b>\n"
+            f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+            f"• Причина: <code>{msg}</code>\n\n"
+            f"🔗 <a href='{url}'>Купить вручную</a>"
+        )
+
+
 def fragment_sniper_loop():
     """
-    Fast-polling Fragment watcher. Sends a Telegram alert when a listing is
-    priced at least `margin` TON below the cached stable floor. Alert-only.
+    Fast-polling Fragment watcher. When a listing is priced at least `margin`
+    TON below the cached stable floor it sends a Telegram alert, and — if
+    Fragment auto-buy is enabled — fires a background buy in parallel.
     """
     log("Fragment sniper loop started (paused until /fragment_on).")
     current_sleep = 5.0
@@ -1197,6 +1482,15 @@ def fragment_sniper_loop():
                         f"• 💸 Выгода: <b>~{real_profit:.3f} TON</b>\n\n"
                         f"🔗 <a href='{url}'>Открыть на Fragment</a>"
                     )
+
+                    with state_lock:
+                        autobuy_on = state["fragment_autobuy"]
+                    if autobuy_on:
+                        threading.Thread(
+                            target=_fragment_buy_worker,
+                            args=(item, col, name, price_ton, cached_floor, url),
+                            daemon=True,
+                        ).start()
 
                 time.sleep(0.5)
 
