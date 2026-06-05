@@ -59,40 +59,51 @@ HEADERS_TEMPLATE = {
 }
 
 # =====================================================================
-# FRAGMENT (fragment.com) CONFIGURATION
+# GETGEMS (getgems.io) CONFIGURATION
 # =====================================================================
-# Fragment is Telegram's official collectibles marketplace. It has NO public,
-# documented API: the web frontend POSTs form-encoded requests to
-# `https://fragment.com/api?hash=<hash>`, where <hash> is embedded in the page
-# HTML and rotates. Reading prices generally requires a logged-in session
-# (the `stel_token` / `stel_ssid` cookies).
+# GetGems is a TON NFT marketplace with a GraphQL API at
+# `https://api.getgems.io/graphql`. To search a specific collection it needs
+# that collection's CONTRACT ADDRESS — these Telegram-gift collections each
+# live at their own TON address, which the user supplies via config /
+# the /getgems_address command (we cannot know them in advance).
+#
+# Buying a fix-price sale on GetGems is non-custodial: the buyer's wallet sends
+# the sale price (+ gas) to the sale contract address that comes WITH the
+# listing data. So auto-buy builds the transaction from the listing itself
+# (sale address + price), not from invented values.
 #
 # IMPORTANT — UNVERIFIED INTEGRATION POINTS (adjust after a real test run):
-#   • FRAGMENT_SEARCH_METHOD — the api `method` name for the gift marketplace.
-#   • The request payload fields below (sort/filter keys).
-#   • The response shape parsed in `_fragment_parse_listings`.
-# These are best-effort guesses based on the known shape of fragment.com/api
-# and almost certainly need tweaking once you can observe a real response.
-FRAGMENT_BASE_URL = "https://fragment.com"
-FRAGMENT_GIFTS_PAGE = "https://fragment.com/gifts"
-FRAGMENT_SEARCH_METHOD = "searchGiftsForSale"
-# Method that asks Fragment to PREPARE a purchase. Fragment is non-custodial:
-# it should return one or more TON transaction messages (destination address,
-# amount, optional payload/stateInit) that the buyer's wallet must sign — the
-# same shape TON Connect uses. UNVERIFIED method name / response shape.
-FRAGMENT_BUY_INIT_METHOD = "initGiftBuyRequest"
-# Fee buffer (TON) added on top of the price cap when sanity-checking the total
-# value of the transaction Fragment asks us to sign. Protects against a
-# malformed/oversized transaction draining the wallet beyond the intended cap.
-FRAGMENT_TX_FEE_BUFFER_TON = 0.2
+#   • GETGEMS_SEARCH_QUERY — the GraphQL query / field names for on-sale items.
+#   • The response shape parsed in `_getgems_parse_listings`.
+#   • GETGEMS_BUY_GAS_TON / the buy message body (sale-contract opcode).
+GETGEMS_GRAPHQL_URL = "https://api.getgems.io/graphql"
 
-FRAGMENT_HEADERS = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+# Per-collection TON contract addresses. Empty by default — fill via config
+# ("getgems_addresses": {"Vice Cream": "EQ..."}) or /getgems_address <name> <addr>.
+GETGEMS_COLLECTION_ADDRESSES = {name: "" for name in TARGET_COLLECTIONS}
+
+# GraphQL query returning the cheapest fix-price items in a collection.
+GETGEMS_SEARCH_QUERY = (
+    "query nftSearch($address: String!, $count: Int!) {"
+    "  alphaNftItemSearch(query: {collectionAddress: $address, saleType: \"fix_price\"},"
+    "    sort: {byPrice: {direction: asc}}, first: $count) {"
+    "    edges { node { name address"
+    "      sale { __typename ... on NftSaleFixPrice { fullPrice address } } } } } }"
+)
+
+# Extra TON sent with a buy to cover gas/forward fees (excess is returned by the
+# sale contract). UNVERIFIED — depends on the sale contract version.
+GETGEMS_BUY_GAS_TON = 1.0
+# Fee buffer (TON) added on top of the price cap when sanity-checking the total
+# value of the transaction, guarding against draining the wallet beyond intent.
+GETGEMS_TX_FEE_BUFFER_TON = GETGEMS_BUY_GAS_TON + 0.2
+
+GETGEMS_HEADERS = {
+    "Accept": "application/json",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Origin": FRAGMENT_BASE_URL,
-    "Referer": FRAGMENT_GIFTS_PAGE,
-    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/json",
+    "Origin": "https://getgems.io",
+    "Referer": "https://getgems.io/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
 
@@ -111,22 +122,26 @@ state = {
     "offers_delay": 30.0,     # Seconds between offer re-check cycles
     "last_analysis_time": None,
     "consecutive_429": 0,
-    # --- Fragment (fragment.com) ---
-    "fragment_cookie": "",      # Session cookie / token string for fragment.com auth
-    "fragment_running": False,  # Whether the Fragment floor watcher / alert loop is active
-    "fragment_delay": 5.0,      # Polling interval (seconds) for the Fragment sniper
-    # --- Fragment auto-buy (signs a TON transaction with the wallet below) ---
-    "fragment_autobuy": False,        # Master switch for Fragment auto-buy (default OFF)
-    "fragment_wallet_mnemonic": "",   # 24-word seed of the buying wallet — SENSITIVE, see warnings
-    "fragment_max_buy_price": 0.0,    # Hard safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
+    # --- GetGems (getgems.io) ---
+    "getgems_api_key": "",       # Optional API key for getgems API (sent as Authorization if set)
+    "getgems_running": False,    # Whether the GetGems floor watcher / alert loop is active
+    "getgems_delay": 5.0,        # Polling interval (seconds) for the GetGems sniper
+    "getgems_addresses": {},     # {collection_name: contract_address} overrides from config
+    # --- GetGems auto-buy (signs a TON transaction with the wallet below) ---
+    "getgems_autobuy": False,        # Master switch for GetGems auto-buy (default OFF)
+    "getgems_wallet_mnemonic": "",   # 24-word seed of the buying wallet — SENSITIVE, see warnings
+    "getgems_max_buy_price": 0.0,    # Hard safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
 }
 
 # Calculated market floor prices
 # Calculated as the median of the 2nd, 3rd, and 4th cheapest items to prevent outliers from skewing
 stable_floors = {name: None for name in TARGET_COLLECTIONS}
 
-# Calculated Fragment floor prices (same collections as MRKT, computed the same way)
-fragment_floors = {name: None for name in TARGET_COLLECTIONS}
+# Calculated GetGems floor prices (same collections as MRKT, computed the same way)
+getgems_floors = {name: None for name in TARGET_COLLECTIONS}
+
+# Resolved GetGems collection addresses (constant defaults merged with config overrides)
+getgems_addresses = dict(GETGEMS_COLLECTION_ADDRESSES)
 
 # Cache of already placed offers: {collection_name: placed_price_ton}
 # Used to skip re-placing an offer if the price hasn't changed significantly
@@ -168,12 +183,18 @@ def load_config():
                 state["margin"] = float(cfg.get("margin", 0.2))
                 state["delay"] = float(cfg.get("delay", 1.5))
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
-                state["fragment_cookie"] = cfg.get("fragment_cookie", "")
-                state["fragment_running"] = bool(cfg.get("fragment_running", False))
-                state["fragment_delay"] = float(cfg.get("fragment_delay", 5.0))
-                state["fragment_autobuy"] = bool(cfg.get("fragment_autobuy", False))
-                state["fragment_wallet_mnemonic"] = cfg.get("fragment_wallet_mnemonic", "")
-                state["fragment_max_buy_price"] = float(cfg.get("fragment_max_buy_price", 0.0))
+                state["getgems_api_key"] = cfg.get("getgems_api_key", "")
+                state["getgems_running"] = bool(cfg.get("getgems_running", False))
+                state["getgems_delay"] = float(cfg.get("getgems_delay", 5.0))
+                state["getgems_autobuy"] = bool(cfg.get("getgems_autobuy", False))
+                state["getgems_wallet_mnemonic"] = cfg.get("getgems_wallet_mnemonic", "")
+                state["getgems_max_buy_price"] = float(cfg.get("getgems_max_buy_price", 0.0))
+                cfg_addrs = cfg.get("getgems_addresses", {})
+                if isinstance(cfg_addrs, dict):
+                    state["getgems_addresses"] = cfg_addrs
+                    for name, addr in cfg_addrs.items():
+                        if name in getgems_addresses:
+                            getgems_addresses[name] = addr
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -207,12 +228,13 @@ def save_config():
             "delay": state["delay"],
             "offers_delay": state["offers_delay"],
             "sniper_mode": state["sniper_mode"],
-            "fragment_cookie": state["fragment_cookie"],
-            "fragment_running": state["fragment_running"],
-            "fragment_delay": state["fragment_delay"],
-            "fragment_autobuy": state["fragment_autobuy"],
-            "fragment_wallet_mnemonic": state["fragment_wallet_mnemonic"],
-            "fragment_max_buy_price": state["fragment_max_buy_price"],
+            "getgems_api_key": state["getgems_api_key"],
+            "getgems_running": state["getgems_running"],
+            "getgems_delay": state["getgems_delay"],
+            "getgems_autobuy": state["getgems_autobuy"],
+            "getgems_wallet_mnemonic": state["getgems_wallet_mnemonic"],
+            "getgems_max_buy_price": state["getgems_max_buy_price"],
+            "getgems_addresses": state["getgems_addresses"],
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -280,25 +302,19 @@ class ImpersonatedSession:
 session = ImpersonatedSession()
 
 # =====================================================================
-# FRAGMENT (fragment.com) HTTP SESSION + LISTINGS
+# GETGEMS (getgems.io) HTTP SESSION + LISTINGS
 # =====================================================================
-class FragmentSession:
+class GetGemsSession:
     """
-    Thin client for fragment.com's internal `/api?hash=<hash>` endpoint.
+    Thin client for getgems.io's GraphQL API.
 
-    The `hash` is scraped from the gifts page HTML and cached; it is refreshed
-    automatically if a request looks unauthenticated/expired. Authentication
-    (when needed) is supplied as a raw Cookie string via config `fragment_cookie`
-    (set it with the Telegram command /fragment_token).
-
-    NOTE: This is a best-effort client for an undocumented endpoint. See the
-    UNVERIFIED INTEGRATION POINTS note near the FRAGMENT_* constants.
+    An optional API key (config `getgems_api_key`) is sent as the Authorization
+    header when present. This is a best-effort client for an endpoint whose
+    exact query/response shape is UNVERIFIED — see the GETGEMS_* constants.
     """
 
     def __init__(self):
         self._local = threading.local()
-        self._hash = None
-        self._hash_lock = threading.Lock()
 
     @property
     def session(self):
@@ -313,253 +329,158 @@ class FragmentSession:
         return self._local.session
 
     def _headers(self):
-        headers = FRAGMENT_HEADERS.copy()
+        headers = GETGEMS_HEADERS.copy()
         with state_lock:
-            cookie = state["fragment_cookie"]
-        if cookie:
-            headers["Cookie"] = cookie
+            api_key = state["getgems_api_key"]
+        if api_key:
+            headers["Authorization"] = api_key
         return headers
 
-    def _refresh_hash(self, force=False):
-        """Scrape the rotating api hash from the gifts page HTML."""
-        with self._hash_lock:
-            if self._hash and not force:
-                return self._hash
-            try:
-                r = self.session.get(FRAGMENT_GIFTS_PAGE, headers=self._headers(), timeout=10)
-                html = r.text if r is not None else ""
-                # Frontend bootstraps with: "apiUrl":"\/api?hash=XXXXXXXX"
-                m = re.search(r'apiUrl"\s*:\s*"\\?/api\?hash=([0-9a-fA-F]+)"', html)
-                if not m:
-                    m = re.search(r'/api\?hash=([0-9a-fA-F]+)', html)
-                if m:
-                    self._hash = m.group(1)
-                    log(f"[Fragment] API hash refreshed.")
-                else:
-                    log("[Fragment] Could not locate api hash in page HTML.", "WARN")
-            except Exception as e:
-                log(f"[Fragment] Failed to refresh api hash: {e}", "ERROR")
-            return self._hash
-
-    def api_post(self, data, timeout=10):
-        """POST form-encoded data to /api?hash=<hash>, refreshing the hash on demand."""
-        hash_val = self._refresh_hash()
-        if not hash_val:
-            raise Exception("FRAGMENT_NO_HASH")
-        url = f"{FRAGMENT_BASE_URL}/api?hash={hash_val}"
+    def graphql(self, query, variables, timeout=10):
+        payload = {"query": query, "variables": variables}
         try:
-            r = self.session.post(url, data=data, headers=self._headers(), timeout=timeout)
+            return self.session.post(GETGEMS_GRAPHQL_URL, json=payload, headers=self._headers(), timeout=timeout)
         except Exception as e:
-            log(f"[Fragment] POST exception to {url}: {e}", "ERROR")
+            log(f"[GetGems] GraphQL POST exception: {e}", "ERROR")
             return None
-        # A rotated/expired hash usually surfaces as 400/404 — refresh once and retry.
-        if r is not None and r.status_code in (400, 404):
-            hash_val = self._refresh_hash(force=True)
-            if hash_val:
-                url = f"{FRAGMENT_BASE_URL}/api?hash={hash_val}"
-                try:
-                    r = self.session.post(url, data=data, headers=self._headers(), timeout=timeout)
-                except Exception as e:
-                    log(f"[Fragment] POST retry exception: {e}", "ERROR")
-                    return None
-        return r
 
 
-fragment_session = FragmentSession()
+getgems_session = GetGemsSession()
 
 
-def _fragment_parse_listings(body):
+def getgems_get_address(collection_name):
+    """Resolve the configured GetGems contract address for a collection, or ''."""
+    with state_lock:
+        overrides = dict(state["getgems_addresses"])
+    return overrides.get(collection_name) or getgems_addresses.get(collection_name) or ""
+
+
+def _getgems_node_to_item(node):
+    """Normalize one GraphQL node into the bot's item shape (price in nanoTON)."""
+    if not isinstance(node, dict):
+        return None
+    sale = node.get("sale") or {}
+    full_price = sale.get("fullPrice") if isinstance(sale, dict) else None
+    if full_price is None:
+        full_price = node.get("price") or node.get("fullPrice")
+    if full_price is None:
+        return None
+    try:
+        price_nano = int(full_price)  # GetGems prices are nanoTON strings
+    except (TypeError, ValueError):
+        try:
+            price_nano = int(float(full_price) * 1e9)
+        except (TypeError, ValueError):
+            return None
+    if price_nano <= 0:
+        return None
+    item_address = node.get("address") or node.get("nftAddress")
+    sale_address = sale.get("address") if isinstance(sale, dict) else None
+    return {
+        "salePrice": price_nano,
+        "id": item_address,
+        "sale_address": sale_address,
+        "name": node.get("name") or node.get("title"),
+        "number": node.get("number") or node.get("index"),
+        "url": f"https://getgems.io/nft/{item_address}" if item_address else "https://getgems.io",
+    }
+
+
+def _getgems_parse_listings(body):
     """
-    Normalize a Fragment search response into the same item shape the rest of
-    the bot uses: a list of dicts with at least {"salePrice": <nanoTON int>}.
-    Prices are stored in nanoTON so the existing calculate_stable_floor() works
-    unchanged.
-
-    Handles three plausible response shapes (undocumented API — defensive):
-      1. JSON list of item dicts.
-      2. JSON dict with an items/gifts/results list.
-      3. JSON dict with an "html" string blob (Fragment commonly returns this);
-         prices are regex-extracted from the markup as a fallback.
+    Normalize a GetGems GraphQL response into a list of item dicts.
+    Defensive against the exact (UNVERIFIED) field path by walking the response
+    for an `edges` list of `node` objects, or a plain list of items.
     """
-    def _to_items(raw_items):
+    items = []
+
+    def _collect_edges(edges):
         out = []
-        for it in raw_items:
-            if not isinstance(it, dict):
-                continue
-            price_ton = None
-            # Common explicit price fields, in TON.
-            for k in ("price", "priceTon", "amount", "value"):
-                if it.get(k) is not None:
-                    try:
-                        price_ton = float(it[k])
-                        break
-                    except (TypeError, ValueError):
-                        pass
-            # nanoTON-style fields.
-            if price_ton is None:
-                for k in ("priceNanoTONs", "amountNano", "priceNano"):
-                    if it.get(k) is not None:
-                        try:
-                            price_ton = float(it[k]) / 1e9
-                            break
-                        except (TypeError, ValueError):
-                            pass
-            if price_ton is None or price_ton <= 0:
-                continue
-            out.append({
-                "salePrice": int(price_ton * 1e9),
-                "id": it.get("id") or it.get("itemId") or it.get("giftId"),
-                "name": it.get("name") or it.get("title"),
-                "number": it.get("number") or it.get("num"),
-                "url": it.get("url") or it.get("link"),
-            })
+        for e in edges:
+            node = e.get("node") if isinstance(e, dict) else None
+            it = _getgems_node_to_item(node if node is not None else e)
+            if it:
+                out.append(it)
         return out
 
-    if isinstance(body, list):
-        return _to_items(body)
-
     if isinstance(body, dict):
-        for key in ("items", "gifts", "results", "listings"):
-            if isinstance(body.get(key), list):
-                items = _to_items(body[key])
-                if items:
-                    return items
-        html = body.get("html")
-        if isinstance(html, str) and html:
-            # Fallback: pull "<number> TON" amounts out of the markup.
-            prices = re.findall(r'([\d\s.,]+)\s*(?:TON|💎)', html)
-            items = []
-            for p in prices:
-                cleaned = p.replace(" ", "").replace(",", "")
-                try:
-                    val = float(cleaned)
-                except ValueError:
-                    continue
-                if val > 0:
-                    items.append({"salePrice": int(val * 1e9), "id": None, "name": None, "number": None, "url": None})
-            return items
-    return []
+        data = body.get("data", body)
+        # Find the first dict with an "edges" list anywhere one level down.
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, dict) and isinstance(v.get("edges"), list):
+                    items = _collect_edges(v["edges"])
+                    if items:
+                        return items
+                if isinstance(v, list):
+                    cand = _collect_edges(v)
+                    if cand:
+                        return cand
+        if isinstance(data.get("edges"), list):
+            return _collect_edges(data["edges"])
+    elif isinstance(body, list):
+        return _collect_edges(body)
+    return items
 
 
-def fragment_fetch_listings(collection_name, count=10):
+def getgems_fetch_listings(collection_name, count=10):
     """
-    Fetch the cheapest `count` listings for a collection from Fragment, sorted
-    by price ascending. Returns a normalized list (see _fragment_parse_listings).
-
-    The request payload uses best-guess keys for the undocumented gift
-    marketplace endpoint and may need adjustment after a real test run.
+    Fetch the cheapest `count` fix-price listings for a collection from GetGems.
+    Requires the collection's contract address (set via /getgems_address).
+    Returns a normalized list (see _getgems_parse_listings).
     """
-    payload = {
-        "method": FRAGMENT_SEARCH_METHOD,
-        "query": collection_name,
-        "filter": "sale",
-        "sort": "price_asc",
-        "limit": count,
-    }
-    r = fragment_session.api_post(payload)
+    address = getgems_get_address(collection_name)
+    if not address:
+        raise Exception("GETGEMS_NO_ADDRESS")
+
+    variables = {"address": address, "count": count}
+    r = getgems_session.graphql(GETGEMS_SEARCH_QUERY, variables)
     if r is None:
-        raise Exception("FRAGMENT_CONNECTION_FAILED")
+        raise Exception("GETGEMS_CONNECTION_FAILED")
     if r.status_code == 429:
         raise Exception("API_429")
-    if r.status_code == 401 or r.status_code == 403:
-        raise Exception("FRAGMENT_AUTH_REQUIRED")
+    if r.status_code in (401, 403):
+        raise Exception("GETGEMS_AUTH_REQUIRED")
     if r.status_code != 200:
-        raise Exception(f"FRAGMENT_ERROR_{r.status_code}")
+        raise Exception(f"GETGEMS_ERROR_{r.status_code}")
     try:
         body = r.json()
     except Exception:
-        raise Exception("FRAGMENT_BAD_JSON")
-    return _fragment_parse_listings(body)
+        raise Exception("GETGEMS_BAD_JSON")
+    if isinstance(body, dict) and body.get("errors"):
+        raise Exception(f"GETGEMS_GRAPHQL_ERROR: {body['errors']}")
+    return _getgems_parse_listings(body)
 
 
 # =====================================================================
-# FRAGMENT AUTO-BUY (TON wallet transaction signing)
+# GETGEMS AUTO-BUY (TON wallet transaction signing)
 # =====================================================================
-# Fragment is non-custodial: a purchase is completed by signing a TON transfer
-# with the buyer's own wallet. So auto-buy here needs the wallet's seed phrase
-# (config `fragment_wallet_mnemonic`) plus a TON SDK to sign + broadcast.
+# GetGems is non-custodial: buying a fix-price sale = sending the price (+ gas)
+# to the sale CONTRACT address that comes with the listing. So auto-buy builds
+# the transaction from the listing itself (sale address + price) — not invented
+# values — then signs and broadcasts it with the configured wallet.
 #
 # SAFETY MODEL:
-#   • Disabled unless `fragment_autobuy` is True AND `fragment_max_buy_price` > 0.
-#   • We never INVENT a destination/amount — we sign ONLY the transaction
-#     messages Fragment returns from FRAGMENT_BUY_INIT_METHOD.
-#   • Before signing, the SUMMED outgoing value is checked against
-#     (max_buy_price + fee buffer); anything larger is refused.
+#   • Disabled unless `getgems_autobuy` is True AND `getgems_max_buy_price` > 0.
+#   • Destination = the listing's sale contract address (from the API).
+#   • The item price must be within the price cap; total sent (price + gas) is
+#     also bounded by (cap + fee buffer) before signing.
 #   • The TON SDK (pytoniq) is imported lazily; if missing, auto-buy aborts
 #     cleanly and falls back to an alert (no broadcast).
 #
-# UNVERIFIED: the FRAGMENT_BUY_INIT_METHOD request/response shape. Test with a
-# cheap item and a low cap first.
+# UNVERIFIED: GETGEMS_BUY_GAS_TON and the buy message body (sale-contract op).
+# Test with a cheap item and a low cap first.
 
-def _fragment_parse_tx_messages(body):
-    """
-    Extract a list of TON transaction messages from Fragment's purchase-init
-    response. Returns list of {"address": str, "amount_nano": int, "payload": str|None}.
-    Mirrors the TON Connect `sendTransaction` 'messages' array shape.
-    """
-    if not isinstance(body, dict):
-        return []
-    # TON Connect style: {"transaction": {"messages": [...]}} or {"messages": [...]}
-    container = body.get("transaction") if isinstance(body.get("transaction"), dict) else body
-    raw_msgs = container.get("messages")
-    if not isinstance(raw_msgs, list):
-        return []
-    msgs = []
-    for m in raw_msgs:
-        if not isinstance(m, dict):
-            continue
-        address = m.get("address") or m.get("to")
-        amount = m.get("amount") or m.get("value")
-        if not address or amount is None:
-            continue
-        try:
-            amount_nano = int(amount)  # TON Connect amounts are nanoTON strings
-        except (TypeError, ValueError):
-            try:
-                amount_nano = int(float(amount) * 1e9)
-            except (TypeError, ValueError):
-                continue
-        msgs.append({
-            "address": str(address),
-            "amount_nano": amount_nano,
-            "payload": m.get("payload") or m.get("body"),
-        })
-    return msgs
-
-
-def fragment_init_purchase(item):
-    """
-    Ask Fragment to prepare a purchase for `item`. Returns the list of TON
-    transaction messages to sign (see _fragment_parse_tx_messages).
-    UNVERIFIED endpoint — see notes above.
-    """
-    item_id = item.get("id") or item.get("number")
-    if not item_id:
-        raise Exception("FRAGMENT_NO_ITEM_ID")
-    payload = {"method": FRAGMENT_BUY_INIT_METHOD, "id": item_id}
-    r = fragment_session.api_post(payload)
-    if r is None:
-        raise Exception("FRAGMENT_CONNECTION_FAILED")
-    if r.status_code in (401, 403):
-        raise Exception("FRAGMENT_AUTH_REQUIRED")
-    if r.status_code != 200:
-        raise Exception(f"FRAGMENT_BUY_INIT_ERROR_{r.status_code}")
-    try:
-        body = r.json()
-    except Exception:
-        raise Exception("FRAGMENT_BAD_JSON")
-    return _fragment_parse_tx_messages(body)
-
-
-def _fragment_sign_and_send(messages, mnemonic):
+def _ton_sign_and_send(messages, mnemonic):
     """
     Sign and broadcast the given TON transaction messages with the configured
-    wallet. Uses pytoniq (lazy import). Returns (success: bool, msg: str).
+    wallet. `messages` = list of {"address", "amount_nano", "payload"|None}.
+    Uses pytoniq (lazy import). Returns (success: bool, msg: str).
     """
     try:
         from pytoniq import LiteBalancer, WalletV4R2  # type: ignore
     except Exception:
-        return False, ("TON SDK не установлен. Установите: pip install pytoniq")
+        return False, "TON SDK не установлен. Установите: pip install pytoniq"
 
     words = mnemonic.strip().split()
     if len(words) not in (12, 24):
@@ -588,21 +509,21 @@ def _fragment_sign_and_send(messages, mnemonic):
         return False, f"TON_SEND_ERROR: {e}"
 
 
-def fragment_execute_buy(item):
+def getgems_execute_buy(item):
     """
-    Full Fragment auto-buy flow with safety guards. Returns (success, message).
+    Full GetGems auto-buy flow with safety guards. Returns (success, message).
     """
     with state_lock:
-        autobuy = state["fragment_autobuy"]
-        mnemonic = state["fragment_wallet_mnemonic"]
-        max_price = state["fragment_max_buy_price"]
+        autobuy = state["getgems_autobuy"]
+        mnemonic = state["getgems_wallet_mnemonic"]
+        max_price = state["getgems_max_buy_price"]
 
     if not autobuy:
         return False, "AUTOBUY_DISABLED"
     if max_price <= 0:
-        return False, "NO_PRICE_CAP (установите /fragment_maxprice)"
+        return False, "NO_PRICE_CAP (установите /getgems_maxprice)"
     if not mnemonic:
-        return False, "NO_WALLET (установите /fragment_wallet)"
+        return False, "NO_WALLET (установите /getgems_wallet)"
 
     price_ton = float(item.get("salePrice", 0)) / 1e9
     if price_ton <= 0:
@@ -610,21 +531,23 @@ def fragment_execute_buy(item):
     if price_ton > max_price:
         return False, f"PRICE_ABOVE_CAP ({price_ton:.3f} > {max_price:.3f} TON)"
 
-    # Ask Fragment to build the purchase transaction.
-    messages = fragment_init_purchase(item)
-    if not messages:
-        return False, "NO_TX_FROM_FRAGMENT"
+    sale_address = item.get("sale_address")
+    if not sale_address:
+        return False, "NO_SALE_ADDRESS (нет адреса контракта продажи в листинге)"
 
-    # Hard guard: total value we are about to sign must not exceed cap + fee buffer.
-    total_nano = sum(m["amount_nano"] for m in messages)
-    limit_nano = int((max_price + FRAGMENT_TX_FEE_BUFFER_TON) * 1e9)
+    # Build the buy transaction: send price + gas to the sale contract.
+    total_nano = item.get("salePrice", 0) + int(GETGEMS_BUY_GAS_TON * 1e9)
+
+    # Hard guard: total value must not exceed cap + fee buffer.
+    limit_nano = int((max_price + GETGEMS_TX_FEE_BUFFER_TON) * 1e9)
     if total_nano > limit_nano:
         return False, (
             f"TX_VALUE_OVER_LIMIT: транзакция на {total_nano/1e9:.3f} TON превышает "
             f"лимит {limit_nano/1e9:.3f} TON — покупка отменена ради безопасности."
         )
 
-    return _fragment_sign_and_send(messages, mnemonic)
+    messages = [{"address": str(sale_address), "amount_nano": total_nano, "payload": None}]
+    return _ton_sign_and_send(messages, mnemonic)
 
 
 # =====================================================================
@@ -701,14 +624,15 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
-                "\n<b>🧩 Fragment (fragment.com):</b>\n"
-                "🔑 /fragment_token &lt;токен/cookie&gt; - Авторизация сессии fragment.com\n"
-                "🧩 /fragment_on - Включить мониторинг Fragment (флор + алерты)\n"
-                "🧩 /fragment_off - Выключить мониторинг Fragment\n"
-                "👛 /fragment_wallet &lt;сид-фраза&gt; - Кошелёк для автовыкупа (12/24 слова)\n"
-                "🎯 /fragment_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
-                "⚡ /fragment_autobuy_on - Включить автовыкуп Fragment\n"
-                "🛑 /fragment_autobuy_off - Выключить автовыкуп Fragment\n\n"
+                "\n<b>💎 GetGems (getgems.io):</b>\n"
+                "🔑 /getgems_apikey &lt;ключ&gt; - (Опц.) API-ключ getgems.io\n"
+                "🏷 /getgems_address &lt;коллекция&gt; &lt;адрес&gt; - Задать контракт коллекции\n"
+                "💎 /getgems_on - Включить мониторинг GetGems (флор + алерты)\n"
+                "💎 /getgems_off - Выключить мониторинг GetGems\n"
+                "👛 /getgems_wallet &lt;сид-фраза&gt; - Кошелёк для автовыкупа (12/24 слова)\n"
+                "🎯 /getgems_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
+                "⚡ /getgems_autobuy_on - Включить автовыкуп GetGems\n"
+                "🛑 /getgems_autobuy_off - Выключить автовыкуп GetGems\n\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -722,20 +646,20 @@ class TelegramBot:
             with state_lock:
                 running_status = "🟢 АКТИВЕН" if state["running"] else "🔴 ОСТАНОВЛЕН"
                 offers_status = "🟢 ВКЛЮЧЕНЫ" if state["offers_running"] else "🔴 ВЫКЛЮЧЕНЫ"
-                fragment_status = "🟢 ВКЛЮЧЕН" if state["fragment_running"] else "🔴 ВЫКЛЮЧЕН"
-                fragment_autobuy_status = "🟢 ВКЛЮЧЕН" if state["fragment_autobuy"] else "🔴 ВЫКЛЮЧЕН"
-                fragment_cap = state["fragment_max_buy_price"]
-                fragment_wallet_set = "Задан" if state["fragment_wallet_mnemonic"] else "Отсутствует"
+                getgems_status = "🟢 ВКЛЮЧЕН" if state["getgems_running"] else "🔴 ВЫКЛЮЧЕН"
+                getgems_autobuy_status = "🟢 ВКЛЮЧЕН" if state["getgems_autobuy"] else "🔴 ВЫКЛЮЧЕН"
+                getgems_cap = state["getgems_max_buy_price"]
+                getgems_wallet_set = "Задан" if state["getgems_wallet_mnemonic"] else "Отсутствует"
                 mode_str = "Выкуп + Уведомление" if state["sniper_mode"] == "buy" else "Только Уведомление"
                 margin_val = state["margin"]
                 delay_val = state["delay"]
                 offers_delay_val = state["offers_delay"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
-                fragment_auth = "Задана" if state["fragment_cookie"] else "Отсутствует"
+                getgems_auth = "Задан" if state["getgems_api_key"] else "Отсутствует"
 
             floor_lines = []
             offer_lines = []
-            fragment_floor_lines = []
+            getgems_floor_lines = []
             for c in TARGET_COLLECTIONS:
                 floor_val = stable_floors.get(c)
                 floor_str = f"{floor_val:.2f} TON" if floor_val else "Не определен"
@@ -745,31 +669,31 @@ class TelegramBot:
                 placed_str = f"{placed_val:.2f} TON" if placed_val else "—"
                 offer_lines.append(f"• {c}: <code>{placed_str}</code>")
 
-                frag_val = fragment_floors.get(c)
-                frag_str = f"{frag_val:.2f} TON" if frag_val else "Не определен"
-                fragment_floor_lines.append(f"• {c}: <b>{frag_str}</b>")
+                gg_val = getgems_floors.get(c)
+                gg_str = f"{gg_val:.2f} TON" if gg_val else "Не определен"
+                getgems_floor_lines.append(f"• {c}: <b>{gg_str}</b>")
 
             floors_block = "\n".join(floor_lines)
             offers_block = "\n".join(offer_lines)
-            fragment_floors_block = "\n".join(fragment_floor_lines)
+            getgems_floors_block = "\n".join(getgems_floor_lines)
 
             status_text = (
                 f"📊 <b>Текущий статус снайпера:</b>\n"
                 f"• Режим работы: <b>{running_status}</b>\n"
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
-                f"• Fragment-мониторинг: <b>{fragment_status}</b>\n"
-                f"• Fragment-автовыкуп: <b>{fragment_autobuy_status}</b> (лимит {fragment_cap} TON, кошелёк: {fragment_wallet_set})\n"
+                f"• GetGems-мониторинг: <b>{getgems_status}</b>\n"
+                f"• GetGems-автовыкуп: <b>{getgems_autobuy_status}</b> (лимит {getgems_cap} TON, кошелёк: {getgems_wallet_set})\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
-                f"• Куки Fragment: <code>{fragment_auth}</code>\n"
+                f"• API-ключ GetGems: <code>{getgems_auth}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
                 f"📈 <b>Рыночный флор (MRKT):</b>\n"
                 f"{floors_block}\n\n"
-                f"🧩 <b>Флор Fragment:</b>\n"
-                f"{fragment_floors_block}\n\n"
+                f"💎 <b>Флор GetGems:</b>\n"
+                f"{getgems_floors_block}\n\n"
                 f"✉️ <b>Последние выставленные офферы:</b>\n"
                 f"{offers_block}\n\n"
                 f"⚙️ <b>Статистика:</b>\n"
@@ -894,51 +818,81 @@ class TelegramBot:
             self.send_message("🛑 <b>Авто-офферы выключены.</b>")
             log("Auto-offers mode DISABLED via Telegram command.")
 
-        elif cmd == "/fragment_token":
+        elif cmd == "/getgems_apikey":
             if not args:
                 self.send_message(
-                    "❌ Укажите куки сессии fragment.com. Пример:\n"
-                    "<code>/fragment_token stel_token=...; stel_ssid=...</code>"
+                    "❌ Укажите API-ключ getgems.io. Пример:\n"
+                    "<code>/getgems_apikey &lt;ключ&gt;</code>"
                 )
                 return
-            # Cookie string may contain spaces (after ';'), so re-join all args.
-            new_cookie = " ".join(args).strip()
+            new_key = " ".join(args).strip()
             with state_lock:
-                state["fragment_cookie"] = new_cookie
+                state["getgems_api_key"] = new_key
             save_config()
-            self.send_message("✅ Куки сессии Fragment сохранены.")
+            self.send_message("✅ API-ключ GetGems сохранён.")
 
-        elif cmd == "/fragment_on":
-            with state_lock:
-                cookie = state["fragment_cookie"]
-            if not cookie:
+        elif cmd == "/getgems_address":
+            if len(args) < 2:
                 self.send_message(
-                    "⚠️ Куки Fragment не заданы — публичные данные могут быть недоступны. "
-                    "Рекомендуется сначала задать <code>/fragment_token &lt;cookie&gt;</code>."
+                    "❌ Укажите коллекцию и адрес контракта. Пример:\n"
+                    "<code>/getgems_address Vice Cream EQ...</code>\n"
+                    f"Доступные коллекции: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            # Address is the last token; everything before it is the collection name.
+            addr = args[-1].strip()
+            name_input = " ".join(args[:-1]).strip()
+            match = None
+            for c in TARGET_COLLECTIONS:
+                if c.lower() == name_input.lower():
+                    match = c
+                    break
+            if not match:
+                self.send_message(
+                    f"❌ Неизвестная коллекция «{name_input}».\n"
+                    f"Доступные: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            with state_lock:
+                overrides = dict(state["getgems_addresses"])
+                overrides[match] = addr
+                state["getgems_addresses"] = overrides
+            getgems_addresses[match] = addr
+            save_config()
+            self.send_message(f"✅ Адрес контракта для <b>{match}</b> сохранён:\n<code>{addr}</code>")
+
+        elif cmd == "/getgems_on":
+            missing = [c for c in TARGET_COLLECTIONS if not getgems_get_address(c)]
+            if missing:
+                self.send_message(
+                    "⚠️ Не заданы адреса контрактов для: "
+                    + ", ".join(missing)
+                    + ".\nЭти коллекции будут пропущены. Задайте их командой "
+                    "<code>/getgems_address &lt;коллекция&gt; &lt;адрес&gt;</code>."
                 )
             with state_lock:
-                state["fragment_running"] = True
+                state["getgems_running"] = True
             save_config()
             collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
             self.send_message(
-                f"✅ <b>Мониторинг Fragment включён!</b>\n"
+                f"✅ <b>Мониторинг GetGems включён!</b>\n"
                 f"Считаю флор и слежу за рынком на {collections_str}.\n"
-                f"⚠️ Только уведомления о дешёвых лотах — автовыкуп на Fragment "
-                f"требует подписи транзакции в TON-кошельке и не выполняется ботом."
+                f"⚠️ Автовыкуп на GetGems требует подписи TON-транзакции — "
+                f"включите его отдельно через <code>/getgems_autobuy_on</code>."
             )
-            log("Fragment monitoring ENABLED via Telegram command.")
+            log("GetGems monitoring ENABLED via Telegram command.")
 
-        elif cmd == "/fragment_off":
+        elif cmd == "/getgems_off":
             with state_lock:
-                state["fragment_running"] = False
+                state["getgems_running"] = False
             save_config()
-            self.send_message("🛑 <b>Мониторинг Fragment выключен.</b>")
-            log("Fragment monitoring DISABLED via Telegram command.")
+            self.send_message("🛑 <b>Мониторинг GetGems выключен.</b>")
+            log("GetGems monitoring DISABLED via Telegram command.")
 
-        elif cmd == "/fragment_wallet":
+        elif cmd == "/getgems_wallet":
             if not args:
                 self.send_message(
-                    "❌ Укажите сид-фразу кошелька (12 или 24 слова) для автовыкупа Fragment.\n"
+                    "❌ Укажите сид-фразу кошелька (12 или 24 слова) для автовыкупа GetGems.\n"
                     "⚠️ <b>Внимание:</b> фраза хранится в config.json в открытом виде — "
                     "используйте отдельный кошелёк с небольшим балансом."
                 )
@@ -948,16 +902,16 @@ class TelegramBot:
                 self.send_message("❌ Сид-фраза должна состоять из 12 или 24 слов.")
                 return
             with state_lock:
-                state["fragment_wallet_mnemonic"] = " ".join(words)
+                state["getgems_wallet_mnemonic"] = " ".join(words)
             save_config()
             self.send_message(
-                "✅ Кошелёк Fragment сохранён.\n"
+                "✅ Кошелёк GetGems сохранён.\n"
                 "⚠️ Рекомендуется удалить это сообщение из чата — оно содержит сид-фразу."
             )
 
-        elif cmd == "/fragment_maxprice":
+        elif cmd == "/getgems_maxprice":
             if not args:
-                self.send_message("❌ Укажите макс. цену покупки в TON. Пример: <code>/fragment_maxprice 5</code>")
+                self.send_message("❌ Укажите макс. цену покупки в TON. Пример: <code>/getgems_maxprice 5</code>")
                 return
             try:
                 val = float(args[0])
@@ -965,42 +919,42 @@ class TelegramBot:
                     self.send_message("❌ Цена не может быть отрицательной.")
                     return
                 with state_lock:
-                    state["fragment_max_buy_price"] = val
+                    state["getgems_max_buy_price"] = val
                 save_config()
                 if val == 0:
-                    self.send_message("✅ Лимит сброшен в 0 — автовыкуп Fragment не будет покупать, пока не зададите лимит > 0.")
+                    self.send_message("✅ Лимит сброшен в 0 — автовыкуп GetGems не будет покупать, пока не зададите лимит > 0.")
                 else:
-                    self.send_message(f"✅ Макс. цена автовыкупа Fragment: <b>{val} TON</b>.")
+                    self.send_message(f"✅ Макс. цена автовыкупа GetGems: <b>{val} TON</b>.")
             except ValueError:
                 self.send_message("❌ Неверный формат числа.")
 
-        elif cmd == "/fragment_autobuy_on":
+        elif cmd == "/getgems_autobuy_on":
             with state_lock:
-                has_wallet = bool(state["fragment_wallet_mnemonic"])
-                cap = state["fragment_max_buy_price"]
+                has_wallet = bool(state["getgems_wallet_mnemonic"])
+                cap = state["getgems_max_buy_price"]
             if not has_wallet:
-                self.send_message("❌ Сначала задайте кошелёк: <code>/fragment_wallet &lt;сид-фраза&gt;</code>.")
+                self.send_message("❌ Сначала задайте кошелёк: <code>/getgems_wallet &lt;сид-фраза&gt;</code>.")
                 return
             if cap <= 0:
-                self.send_message("❌ Сначала задайте лимит цены: <code>/fragment_maxprice &lt;TON&gt;</code>.")
+                self.send_message("❌ Сначала задайте лимит цены: <code>/getgems_maxprice &lt;TON&gt;</code>.")
                 return
             with state_lock:
-                state["fragment_autobuy"] = True
+                state["getgems_autobuy"] = True
             save_config()
             self.send_message(
-                f"⚡ <b>Автовыкуп Fragment ВКЛЮЧЁН.</b>\n"
+                f"⚡ <b>Автовыкуп GetGems ВКЛЮЧЁН.</b>\n"
                 f"• Лимит цены: <b>{cap} TON</b>\n"
                 f"• Бот подпишет транзакцию покупки вашим кошельком при выгодном лоте.\n"
-                f"⚠️ Эндпоинты покупки Fragment не проверены — протестируйте на дешёвом лоте с низким лимитом."
+                f"⚠️ Эндпоинты покупки GetGems не проверены — протестируйте на дешёвом лоте с низким лимитом."
             )
-            log("Fragment auto-buy ENABLED via Telegram command.")
+            log("GetGems auto-buy ENABLED via Telegram command.")
 
-        elif cmd == "/fragment_autobuy_off":
+        elif cmd == "/getgems_autobuy_off":
             with state_lock:
-                state["fragment_autobuy"] = False
+                state["getgems_autobuy"] = False
             save_config()
-            self.send_message("🛑 <b>Автовыкуп Fragment выключен.</b>")
-            log("Fragment auto-buy DISABLED via Telegram command.")
+            self.send_message("🛑 <b>Автовыкуп GetGems выключен.</b>")
+            log("GetGems auto-buy DISABLED via Telegram command.")
 
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
@@ -1029,30 +983,33 @@ class TelegramBot:
         except Exception as e:
             self.send_message(f"❌ Ошибка тестирования рынка MRKT: <code>{e}</code>")
 
-        # Fragment test (only if enabled / cookie set) — isolated so MRKT result is unaffected.
+        # GetGems test (only if enabled / api key set) — isolated so MRKT result is unaffected.
         with state_lock:
-            frag_enabled = state["fragment_running"] or bool(state["fragment_cookie"])
-        if frag_enabled:
+            gg_enabled = state["getgems_running"] or bool(state["getgems_api_key"])
+        if gg_enabled:
             try:
-                frag_blocks = []
+                gg_blocks = []
                 for col in TARGET_COLLECTIONS:
-                    listings = fragment_fetch_listings(col, count=10)
+                    if not getgems_get_address(col):
+                        gg_blocks.append(f"<b>{col}:</b>\n• Адрес контракта не задан — пропуск")
+                        continue
+                    listings = getgems_fetch_listings(col, count=10)
                     floor = calculate_stable_floor(listings)
                     floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
                     cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
-                    frag_blocks.append(
+                    gg_blocks.append(
                         f"<b>{col}:</b>\n"
                         f"• Флор: {floor_str}\n"
                         f"• Самый дешевый лот: <code>{cheapest}</code>"
                     )
                     time.sleep(0.3)
                 self.send_message(
-                    "🧩 <b>Результаты анализа Fragment:</b>\n\n"
-                    + "\n\n".join(frag_blocks)
-                    + "\n\n🔌 <i>Соединение с Fragment работает.</i>"
+                    "💎 <b>Результаты анализа GetGems:</b>\n\n"
+                    + "\n\n".join(gg_blocks)
+                    + "\n\n🔌 <i>Соединение с GetGems работает.</i>"
                 )
             except Exception as e:
-                self.send_message(f"❌ Ошибка тестирования Fragment: <code>{e}</code>")
+                self.send_message(f"❌ Ошибка тестирования GetGems: <code>{e}</code>")
 
     def updates_listener_loop(self):
         log("Telegram command listener thread started.")
@@ -1338,19 +1295,18 @@ def floor_analyzer_loop():
 
 
 # =====================================================================
-# FRAGMENT FLOOR ANALYZER + ALERT SNIPER
+# GETGEMS FLOOR ANALYZER + ALERT SNIPER
 # =====================================================================
-# Mirrors the MRKT sniper but for fragment.com, on the SAME collections.
+# Mirrors the MRKT sniper but for getgems.io, on the SAME collections.
 # Floor is computed with the identical calculate_stable_floor() algorithm.
-# This is ALERT-ONLY: buying a collectible on Fragment requires signing a TON
-# wallet transaction, which is out of scope for this HTTP-based bot.
+# Collections without a configured contract address are skipped.
 
-def fragment_floor_analyzer_loop():
-    """Refreshes the Fragment floor cache every 60s while Fragment mode is on."""
-    log("Fragment floor analyzer started (60s refresh cycle, paused until /fragment_on).")
+def getgems_floor_analyzer_loop():
+    """Refreshes the GetGems floor cache every 60s while GetGems mode is on."""
+    log("GetGems floor analyzer started (60s refresh cycle, paused until /getgems_on).")
     while True:
         with state_lock:
-            active = state["fragment_running"]
+            active = state["getgems_running"]
         if not active:
             time.sleep(3.0)
             continue
@@ -1358,84 +1314,87 @@ def fragment_floor_analyzer_loop():
         try:
             computed = {}
             for col in TARGET_COLLECTIONS:
-                listings = fragment_fetch_listings(col, count=10)
+                if not getgems_get_address(col):
+                    continue  # skip collections without a contract address
+                listings = getgems_fetch_listings(col, count=10)
                 computed[col] = calculate_stable_floor(listings)
                 time.sleep(0.5)  # gentle pacing between collections
 
             with state_lock:
                 for col, floor in computed.items():
-                    fragment_floors[col] = floor
+                    getgems_floors[col] = floor
 
-            summary = "  ".join(
-                f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
-                for col, floor in computed.items()
-            )
-            log(f"[Fragment] Floors updated: {summary}")
+            if computed:
+                summary = "  ".join(
+                    f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                    for col, floor in computed.items()
+                )
+                log(f"[GetGems] Floors updated: {summary}")
 
         except Exception as e:
             err_str = str(e)
-            if "FRAGMENT_AUTH_REQUIRED" in err_str:
-                log("[Fragment] Auth required — set cookie via /fragment_token. Pausing Fragment mode.", "ERROR")
+            if "GETGEMS_AUTH_REQUIRED" in err_str:
+                log("[GetGems] Auth required — set API key via /getgems_apikey. Pausing GetGems mode.", "ERROR")
                 tg_bot.send_message(
-                    "❌ <b>Fragment:</b> требуется авторизация. Задайте куки сессии командой "
-                    "<code>/fragment_token &lt;cookie&gt;</code> и снова включите <code>/fragment_on</code>."
+                    "❌ <b>GetGems:</b> требуется авторизация. Задайте API-ключ командой "
+                    "<code>/getgems_apikey &lt;ключ&gt;</code> и снова включите <code>/getgems_on</code>."
                 )
                 with state_lock:
-                    state["fragment_running"] = False
+                    state["getgems_running"] = False
             else:
-                log(f"[Fragment] Floor analyzer error: {e}", "ERROR")
+                log(f"[GetGems] Floor analyzer error: {e}", "ERROR")
                 stats["errors"] += 1
 
         time.sleep(60)
 
 
-def _fragment_buy_worker(item, col, name, price_ton, cached_floor, url):
-    """Runs Fragment auto-buy in a background thread and reports the result."""
+def _getgems_buy_worker(item, col, name, price_ton, cached_floor, url):
+    """Runs GetGems auto-buy in a background thread and reports the result."""
     profit = cached_floor - price_ton
-    log(f"[Fragment] 🚀 Auto-buy attempt: {name} @ {price_ton:.3f} TON")
+    log(f"[GetGems] 🚀 Auto-buy attempt: {name} @ {price_ton:.3f} TON")
     try:
-        success, msg = fragment_execute_buy(item)
+        success, msg = getgems_execute_buy(item)
     except Exception as e:
         success, msg = False, str(e)
 
     if success:
         stats["buys"] += 1
-        log(f"[Fragment] ✅ BOUGHT: {name} @ {price_ton:.3f} TON")
+        log(f"[GetGems] ✅ BOUGHT: {name} @ {price_ton:.3f} TON")
         tg_bot.send_message(
-            f"🎉 <b>FRAGMENT: УСПЕШНЫЙ АВТОВЫКУП!</b>\n\n"
+            f"🎉 <b>GETGEMS: УСПЕШНЫЙ АВТОВЫКУП!</b>\n\n"
             f"• Коллекция: <b>{col}</b>\n"
-            f"• Подарок: <b>{name}</b>\n"
+            f"• NFT: <b>{name}</b>\n"
             f"• Цена: <code>{price_ton:.3f} TON</code>\n"
-            f"• Флор Fragment: <code>{cached_floor:.3f} TON</code>\n"
+            f"• Флор GetGems: <code>{cached_floor:.3f} TON</code>\n"
             f"• 💰 Прибыль: <b>~{profit:.3f} TON</b>\n\n"
-            f"🔗 <a href='{url}'>Открыть на Fragment</a>"
+            f"🔗 <a href='{url}'>Открыть на GetGems</a>"
         )
     else:
         stats["errors"] += 1
-        log(f"[Fragment] ❌ Auto-buy failed: {name} | {msg}", "ERROR")
+        log(f"[GetGems] ❌ Auto-buy failed: {name} | {msg}", "ERROR")
         tg_bot.send_message(
-            f"🚨 <b>FRAGMENT: автовыкуп не удался</b>\n\n"
-            f"• Подарок: <b>{name}</b>\n"
+            f"🚨 <b>GETGEMS: автовыкуп не удался</b>\n\n"
+            f"• NFT: <b>{name}</b>\n"
             f"• Цена: <code>{price_ton:.3f} TON</code>\n"
             f"• Причина: <code>{msg}</code>\n\n"
             f"🔗 <a href='{url}'>Купить вручную</a>"
         )
 
 
-def fragment_sniper_loop():
+def getgems_sniper_loop():
     """
-    Fast-polling Fragment watcher. When a listing is priced at least `margin`
+    Fast-polling GetGems watcher. When a listing is priced at least `margin`
     TON below the cached stable floor it sends a Telegram alert, and — if
-    Fragment auto-buy is enabled — fires a background buy in parallel.
+    GetGems auto-buy is enabled — fires a background buy in parallel.
     """
-    log("Fragment sniper loop started (paused until /fragment_on).")
+    log("GetGems sniper loop started (paused until /getgems_on).")
     current_sleep = 5.0
 
     while True:
         with state_lock:
-            active = state["fragment_running"]
+            active = state["getgems_running"]
             margin_limit = state["margin"]
-            poll_delay = state["fragment_delay"]
+            poll_delay = state["getgems_delay"]
 
         if not active:
             time.sleep(3.0)
@@ -1443,12 +1402,14 @@ def fragment_sniper_loop():
 
         try:
             for col in TARGET_COLLECTIONS:
+                if not getgems_get_address(col):
+                    continue
                 with state_lock:
-                    cached_floor = fragment_floors.get(col)
+                    cached_floor = getgems_floors.get(col)
                 if cached_floor is None:
                     continue
 
-                listings = fragment_fetch_listings(col, count=5)
+                listings = getgems_fetch_listings(col, count=5)
                 stats["scans"] += len(listings)
                 current_sleep = poll_delay
 
@@ -1462,7 +1423,7 @@ def fragment_sniper_loop():
 
                     # Deduplicate by collection+price+number so we don't re-alert the same lot.
                     number = item.get("number") or "?"
-                    dedup_key = f"fragment:{col}:{number}:{price_ton:.4f}"
+                    dedup_key = f"getgems:{col}:{number}:{price_ton:.4f}"
                     with alerted_lock:
                         seen = dedup_key in alerted_ids
                     if seen:
@@ -1471,23 +1432,23 @@ def fragment_sniper_loop():
 
                     stats["alerts"] += 1
                     name = item.get("name") or f"{col} #{number}"
-                    url = item.get("url") or FRAGMENT_GIFTS_PAGE
-                    log(f"[Fragment] 🔔 ALERT: {name} @ {price_ton:.3f} TON (floor {cached_floor:.3f}, profit {real_profit:.3f})")
+                    url = item.get("url") or "https://getgems.io"
+                    log(f"[GetGems] 🔔 ALERT: {name} @ {price_ton:.3f} TON (floor {cached_floor:.3f}, profit {real_profit:.3f})")
                     tg_bot.send_message(
-                        f"🧩 <b>FRAGMENT: дешёвый лот!</b>\n\n"
+                        f"💎 <b>GETGEMS: дешёвый лот!</b>\n\n"
                         f"• Коллекция: <b>{col}</b>\n"
-                        f"• Подарок: <b>{name}</b>\n"
+                        f"• NFT: <b>{name}</b>\n"
                         f"• Цена: <code>{price_ton:.3f} TON</code>\n"
-                        f"• Флор Fragment: <code>{cached_floor:.3f} TON</code>\n"
+                        f"• Флор GetGems: <code>{cached_floor:.3f} TON</code>\n"
                         f"• 💸 Выгода: <b>~{real_profit:.3f} TON</b>\n\n"
-                        f"🔗 <a href='{url}'>Открыть на Fragment</a>"
+                        f"🔗 <a href='{url}'>Открыть на GetGems</a>"
                     )
 
                     with state_lock:
-                        autobuy_on = state["fragment_autobuy"]
+                        autobuy_on = state["getgems_autobuy"]
                     if autobuy_on:
                         threading.Thread(
-                            target=_fragment_buy_worker,
+                            target=_getgems_buy_worker,
                             args=(item, col, name, price_ton, cached_floor, url),
                             daemon=True,
                         ).start()
@@ -1496,17 +1457,17 @@ def fragment_sniper_loop():
 
         except Exception as e:
             err_str = str(e)
-            if "API_429" in err_str:
+            if "429" in err_str:
                 stats["errors"] += 1
                 current_sleep = min(15.0, poll_delay * 2)
-                log(f"[Fragment] 429 rate limit — backing off {current_sleep:.1f}s.", "WARN")
-            elif "FRAGMENT_AUTH_REQUIRED" in err_str:
-                log("[Fragment] Auth required — pausing Fragment mode.", "ERROR")
+                log(f"[GetGems] 429 rate limit — backing off {current_sleep:.1f}s.", "WARN")
+            elif "GETGEMS_AUTH_REQUIRED" in err_str:
+                log("[GetGems] Auth required — pausing GetGems mode.", "ERROR")
                 with state_lock:
-                    state["fragment_running"] = False
+                    state["getgems_running"] = False
             else:
                 stats["errors"] += 1
-                log(f"[Fragment] Sniper loop error: {e}", "ERROR")
+                log(f"[GetGems] Sniper loop error: {e}", "ERROR")
 
         time.sleep(current_sleep)
 
@@ -1841,18 +1802,18 @@ def main():
     # Thread D: Auto-offers loop
     threading.Thread(target=offers_loop, daemon=True).start()
 
-    # Thread E: Fragment floor analyzer (idle until /fragment_on)
-    threading.Thread(target=fragment_floor_analyzer_loop, daemon=True).start()
+    # Thread E: GetGems floor analyzer (idle until /getgems_on)
+    threading.Thread(target=getgems_floor_analyzer_loop, daemon=True).start()
 
-    # Thread F: Fragment alert sniper (idle until /fragment_on)
-    threading.Thread(target=fragment_sniper_loop, daemon=True).start()
+    # Thread F: GetGems alert sniper (idle until /getgems_on)
+    threading.Thread(target=getgems_sniper_loop, daemon=True).start()
 
     # Send startup message to registered chat ID
     tg_bot.send_message(
         "🤖 <b>MRKT Sniper Bot успешно запущен!</b>\n"
         "• Снайпер работает в фоновом режиме.\n"
         "• Авто-офферы: выключены (включить: /offers_on)\n"
-        "• Fragment-мониторинг: выключен (включить: /fragment_on)\n"
+        "• GetGems-мониторинг: выключен (включить: /getgems_on)\n"
         "• Отправьте /status для проверки текущего состояния и цен."
     )
 
