@@ -108,6 +108,17 @@ GETGEMS_HEADERS = {
 }
 
 # =====================================================================
+# TON BLOCKCHAIN API (toncenter.com) CONFIGURATION
+# =====================================================================
+# A toncenter API key (64-hex) lets the bot read on-chain data and broadcast
+# signed transactions over plain HTTPS — used here for an auto-buy pre-flight
+# wallet-balance check and as a transaction broadcast fallback. The key below
+# is the one supplied by the operator; override it in config.json
+# ("ton_api_key") or via the /ton_apikey Telegram command. Keep it private.
+TONCENTER_API_BASE = "https://toncenter.com/api/v2"
+DEFAULT_TON_API_KEY = "59c26cb767cce5edbc28a3bde188c798bd44d72efcb4afba470f5d7ffc381b34"
+
+# =====================================================================
 # GLOBAL STATE
 # =====================================================================
 state = {
@@ -131,6 +142,8 @@ state = {
     "getgems_autobuy": False,        # Master switch for GetGems auto-buy (default OFF)
     "getgems_wallet_mnemonic": "",   # 24-word seed of the buying wallet — SENSITIVE, see warnings
     "getgems_max_buy_price": 0.0,    # Hard safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
+    # --- TON blockchain API (toncenter) ---
+    "ton_api_key": DEFAULT_TON_API_KEY,  # toncenter API key for balance checks + tx broadcast
 }
 
 # Calculated market floor prices
@@ -189,6 +202,7 @@ def load_config():
                 state["getgems_autobuy"] = bool(cfg.get("getgems_autobuy", False))
                 state["getgems_wallet_mnemonic"] = cfg.get("getgems_wallet_mnemonic", "")
                 state["getgems_max_buy_price"] = float(cfg.get("getgems_max_buy_price", 0.0))
+                state["ton_api_key"] = cfg.get("ton_api_key", DEFAULT_TON_API_KEY)
                 cfg_addrs = cfg.get("getgems_addresses", {})
                 if isinstance(cfg_addrs, dict):
                     state["getgems_addresses"] = cfg_addrs
@@ -235,6 +249,7 @@ def save_config():
             "getgems_wallet_mnemonic": state["getgems_wallet_mnemonic"],
             "getgems_max_buy_price": state["getgems_max_buy_price"],
             "getgems_addresses": state["getgems_addresses"],
+            "ton_api_key": state["ton_api_key"],
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -471,11 +486,40 @@ def getgems_fetch_listings(collection_name, count=10):
 # UNVERIFIED: GETGEMS_BUY_GAS_TON and the buy message body (sale-contract op).
 # Test with a cheap item and a low cap first.
 
+def toncenter_get_balance_nano(address):
+    """
+    Read a wallet's balance (in nanoTON) via toncenter's getAddressBalance.
+    Returns an int, or None if the API key is missing or the request fails.
+    Pure HTTPS — does not require the TON SDK.
+    """
+    with state_lock:
+        api_key = state["ton_api_key"]
+    if not api_key:
+        return None
+    try:
+        headers = {"Accept": "application/json", "X-API-Key": api_key}
+        resp = curl_requests.get(
+            f"{TONCENTER_API_BASE}/getAddressBalance",
+            params={"address": address},
+            headers=headers,
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            return None
+        return int(data.get("result"))
+    except Exception as e:
+        log(f"[TON] Balance check failed: {e}", "WARN")
+        return None
+
+
 def _ton_sign_and_send(messages, mnemonic):
     """
     Sign and broadcast the given TON transaction messages with the configured
     wallet. `messages` = list of {"address", "amount_nano", "payload"|None}.
-    Uses pytoniq (lazy import). Returns (success: bool, msg: str).
+    Uses pytoniq (lazy import). If a toncenter API key is configured, runs a
+    pre-flight balance check so we never sign a transfer the wallet can't cover.
+    Returns (success: bool, msg: str).
     """
     try:
         from pytoniq import LiteBalancer, WalletV4R2  # type: ignore
@@ -488,11 +532,26 @@ def _ton_sign_and_send(messages, mnemonic):
 
     import asyncio
 
+    total_nano = sum(int(m["amount_nano"]) for m in messages)
+
     async def _run():
         provider = LiteBalancer.from_mainnet_config(trust_level=2)
         await provider.start_up()
         try:
             wallet = await WalletV4R2.from_mnemonic(provider, words)
+
+            # Pre-flight balance guard via toncenter (skipped if no API key).
+            try:
+                addr_str = wallet.address.to_str(is_user_friendly=True, is_bounceable=False)
+            except Exception:
+                addr_str = str(wallet.address)
+            balance = toncenter_get_balance_nano(addr_str)
+            if balance is not None and balance < total_nano:
+                return False, (
+                    f"INSUFFICIENT_FUNDS: баланс {balance/1e9:.3f} TON < "
+                    f"требуется {total_nano/1e9:.3f} TON — покупка отменена."
+                )
+
             for m in messages:
                 await wallet.transfer(
                     destination=m["address"],
@@ -632,7 +691,8 @@ class TelegramBot:
                 "👛 /getgems_wallet &lt;сид-фраза&gt; - Кошелёк для автовыкупа (12/24 слова)\n"
                 "🎯 /getgems_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
                 "⚡ /getgems_autobuy_on - Включить автовыкуп GetGems\n"
-                "🛑 /getgems_autobuy_off - Выключить автовыкуп GetGems\n\n"
+                "🛑 /getgems_autobuy_off - Выключить автовыкуп GetGems\n"
+                "🔗 /ton_apikey &lt;ключ&gt; - API-ключ toncenter (баланс перед автовыкупом)\n\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -656,6 +716,7 @@ class TelegramBot:
                 offers_delay_val = state["offers_delay"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
                 getgems_auth = "Задан" if state["getgems_api_key"] else "Отсутствует"
+                ton_api_set = "Задан" if state["ton_api_key"] else "Отсутствует"
 
             floor_lines = []
             offer_lines = []
@@ -689,6 +750,7 @@ class TelegramBot:
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
                 f"• API-ключ GetGems: <code>{getgems_auth}</code>\n"
+                f"• TON API (toncenter): <code>{ton_api_set}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
                 f"📈 <b>Рыночный флор (MRKT):</b>\n"
                 f"{floors_block}\n\n"
@@ -955,6 +1017,23 @@ class TelegramBot:
             save_config()
             self.send_message("🛑 <b>Автовыкуп GetGems выключен.</b>")
             log("GetGems auto-buy DISABLED via Telegram command.")
+
+        elif cmd == "/ton_apikey":
+            if not args:
+                self.send_message(
+                    "❌ Укажите API-ключ toncenter.io. Пример:\n"
+                    "<code>/ton_apikey &lt;ключ&gt;</code>"
+                )
+                return
+            new_key = args[0].strip()
+            with state_lock:
+                state["ton_api_key"] = new_key
+            save_config()
+            self.send_message(
+                "✅ TON API-ключ (toncenter) сохранён.\n"
+                "Используется для проверки баланса кошелька перед автовыкупом."
+            )
+            log("TON API key updated via Telegram command.")
 
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
