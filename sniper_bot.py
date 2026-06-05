@@ -16,6 +16,7 @@ if sys.platform.startswith('win'):
         pass
 import threading
 import traceback
+import re
 from datetime import datetime
 import urllib.parse
 
@@ -31,6 +32,18 @@ except Exception:
 # CONSTANTS & CONFIGURATION
 # =====================================================================
 API_BASE_URL = "https://api.tgmrkt.io/api/v1"
+
+# Collections the bot watches for sniping, floor analysis, and auto-offers.
+TARGET_COLLECTIONS = [
+    "Vice Cream",
+    "Chill Flame",
+    "Pet Snake",
+    "Lol Pop",
+    "Mood Pack",
+    "Pool Float",
+    "Big Year",
+]
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
 ALERTED_FILE = os.path.join(SCRIPT_DIR, "alerted_ids.json")
@@ -42,6 +55,99 @@ HEADERS_TEMPLATE = {
     "Content-Type": "application/json",
     "Origin": "https://app.tgmrkt.io",
     "Referer": "https://app.tgmrkt.io/",
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+}
+
+# =====================================================================
+# GETGEMS (getgems.io) CONFIGURATION
+# =====================================================================
+# GetGems is a TON NFT marketplace with a GraphQL API at
+# `https://api.getgems.io/graphql`. To search a specific collection it needs
+# that collection's CONTRACT ADDRESS — these Telegram-gift collections each
+# live at their own TON address, which the user supplies via config /
+# the /getgems_address command (we cannot know them in advance).
+#
+# Buying a fix-price sale on GetGems is non-custodial: the buyer's wallet sends
+# the sale price (+ gas) to the sale contract address that comes WITH the
+# listing data. So auto-buy builds the transaction from the listing itself
+# (sale address + price), not from invented values.
+#
+# IMPORTANT — UNVERIFIED INTEGRATION POINTS (adjust after a real test run):
+#   • GETGEMS_SEARCH_QUERY — the GraphQL query / field names for on-sale items.
+#   • The response shape parsed in `_getgems_parse_listings`.
+#   • GETGEMS_BUY_GAS_TON / the buy message body (sale-contract opcode).
+GETGEMS_GRAPHQL_URL = "https://api.getgems.io/graphql"
+
+# Per-collection TON contract addresses. Empty by default — fill via config
+# ("getgems_addresses": {"Vice Cream": "EQ..."}) or /getgems_address <name> <addr>.
+GETGEMS_COLLECTION_ADDRESSES = {name: "" for name in TARGET_COLLECTIONS}
+
+# GraphQL query returning the cheapest fix-price items in a collection.
+GETGEMS_SEARCH_QUERY = (
+    "query nftSearch($address: String!, $count: Int!) {"
+    "  alphaNftItemSearch(query: {collectionAddress: $address, saleType: \"fix_price\"},"
+    "    sort: {byPrice: {direction: asc}}, first: $count) {"
+    "    edges { node { name address"
+    "      sale { __typename ... on NftSaleFixPrice { fullPrice address } } } } } }"
+)
+
+# Extra TON sent with a buy to cover gas/forward fees (excess is returned by the
+# sale contract). UNVERIFIED — depends on the sale contract version.
+GETGEMS_BUY_GAS_TON = 1.0
+# Fee buffer (TON) added on top of the price cap when sanity-checking the total
+# value of the transaction, guarding against draining the wallet beyond intent.
+GETGEMS_TX_FEE_BUFFER_TON = GETGEMS_BUY_GAS_TON + 0.2
+
+GETGEMS_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Content-Type": "application/json",
+    "Origin": "https://getgems.io",
+    "Referer": "https://getgems.io/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+# =====================================================================
+# TON BLOCKCHAIN API (toncenter.com) CONFIGURATION
+# =====================================================================
+# A toncenter API key (64-hex) lets the bot read on-chain data and broadcast
+# signed transactions over plain HTTPS — used here for an auto-buy pre-flight
+# wallet-balance check and as a transaction broadcast fallback. The key below
+# is the one supplied by the operator; override it in config.json
+# ("ton_api_key") or via the /ton_apikey Telegram command. Keep it private.
+TONCENTER_API_BASE = "https://toncenter.com/api/v2"
+DEFAULT_TON_API_KEY = "59c26cb767cce5edbc28a3bde188c798bd44d72efcb4afba470f5d7ffc381b34"
+
+# =====================================================================
+# PORTALS (portals-market.com) CONFIGURATION
+# =====================================================================
+# Portals is a Telegram-gifts marketplace on TON with its own REST API at
+# https://portals-market.com/api. Like MRKT it is account/custodial-based:
+# buying is a single AUTHENTICATED API call (no on-chain wallet signing) that
+# spends the TON balance of the logged-in Portals account. Auth is a token /
+# Telegram init-data string supplied via /portals_token — we cannot know it in
+# advance. The sniper mirrors MRKT: fast polling, stable-floor analysis, alerts,
+# and optional auto-buy.
+#
+# UNVERIFIED INTEGRATION POINTS (adjust after a real run):
+#   • PORTALS_SEARCH_PATH params and the response shape in _portals_parse_listings
+#   • PORTALS_BUY_PATH request/response handled in portals_execute_buy
+#   • Whether collections are filtered by name or by id (see portals_collections)
+PORTALS_API_BASE = "https://portals-market.com/api"
+PORTALS_SEARCH_PATH = "/nfts/search"
+PORTALS_BUY_PATH = "/nfts/buy"
+
+# Optional per-collection Portals ids. Empty by default; the search falls back
+# to filtering by the collection NAME when an id is not configured. Override via
+# config ("portals_collections": {"Vice Cream": "<id>"}) or /portals_collection.
+PORTALS_COLLECTION_IDS = {name: "" for name in TARGET_COLLECTIONS}
+
+PORTALS_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Content-Type": "application/json",
+    "Origin": "https://portals-market.com",
+    "Referer": "https://portals-market.com/",
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
 }
 
@@ -60,14 +166,41 @@ state = {
     "offers_delay": 30.0,     # Seconds between offer re-check cycles
     "last_analysis_time": None,
     "consecutive_429": 0,
+    # --- GetGems (getgems.io) ---
+    "getgems_api_key": "",       # Optional API key for getgems API (sent as Authorization if set)
+    "getgems_running": False,    # Whether the GetGems floor watcher / alert loop is active
+    "getgems_delay": 5.0,        # Polling interval (seconds) for the GetGems sniper
+    "getgems_addresses": {},     # {collection_name: contract_address} overrides from config
+    # --- GetGems auto-buy (signs a TON transaction with the wallet below) ---
+    "getgems_autobuy": False,        # Master switch for GetGems auto-buy (default OFF)
+    "getgems_wallet_mnemonic": "",   # 24-word seed of the buying wallet — SENSITIVE, see warnings
+    "getgems_max_buy_price": 0.0,    # Hard safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
+    # --- TON blockchain API (toncenter) ---
+    "ton_api_key": DEFAULT_TON_API_KEY,  # toncenter API key for balance checks + tx broadcast
+    # --- Portals (portals-market.com) ---
+    "portals_token": "",          # Auth token / init-data for portals-market.com (set via /portals_token)
+    "portals_running": False,     # Whether the Portals floor watcher / sniper loop is active
+    "portals_delay": 1.5,         # Fast polling interval (seconds) for the Portals sniper
+    "portals_collections": {},    # {collection_name: portals_collection_id} overrides from config
+    "portals_autobuy": False,     # Master switch for Portals auto-buy via API (default OFF)
+    "portals_max_buy_price": 0.0, # Safety cap (TON). 0 = auto-buy disabled, must be set > 0 to buy.
 }
 
 # Calculated market floor prices
 # Calculated as the median of the 2nd, 3rd, and 4th cheapest items to prevent outliers from skewing
-stable_floors = {
-    "Vice Cream": None,
-    "Chill Flame": None
-}
+stable_floors = {name: None for name in TARGET_COLLECTIONS}
+
+# Calculated GetGems floor prices (same collections as MRKT, computed the same way)
+getgems_floors = {name: None for name in TARGET_COLLECTIONS}
+
+# Resolved GetGems collection addresses (constant defaults merged with config overrides)
+getgems_addresses = dict(GETGEMS_COLLECTION_ADDRESSES)
+
+# Calculated Portals floor prices (same collections, computed the same way)
+portals_floors = {name: None for name in TARGET_COLLECTIONS}
+
+# Resolved Portals collection ids (constant defaults merged with config overrides)
+portals_collections = dict(PORTALS_COLLECTION_IDS)
 
 # Cache of already placed offers: {collection_name: placed_price_ton}
 # Used to skip re-placing an offer if the price hasn't changed significantly
@@ -109,6 +242,30 @@ def load_config():
                 state["margin"] = float(cfg.get("margin", 0.2))
                 state["delay"] = float(cfg.get("delay", 1.5))
                 state["offers_delay"] = float(cfg.get("offers_delay", 30.0))
+                state["getgems_api_key"] = cfg.get("getgems_api_key", "")
+                state["getgems_running"] = bool(cfg.get("getgems_running", False))
+                state["getgems_delay"] = float(cfg.get("getgems_delay", 5.0))
+                state["getgems_autobuy"] = bool(cfg.get("getgems_autobuy", False))
+                state["getgems_wallet_mnemonic"] = cfg.get("getgems_wallet_mnemonic", "")
+                state["getgems_max_buy_price"] = float(cfg.get("getgems_max_buy_price", 0.0))
+                state["ton_api_key"] = cfg.get("ton_api_key", DEFAULT_TON_API_KEY)
+                state["portals_token"] = cfg.get("portals_token", "")
+                state["portals_running"] = bool(cfg.get("portals_running", False))
+                state["portals_delay"] = float(cfg.get("portals_delay", 1.5))
+                state["portals_autobuy"] = bool(cfg.get("portals_autobuy", False))
+                state["portals_max_buy_price"] = float(cfg.get("portals_max_buy_price", 0.0))
+                cfg_pcols = cfg.get("portals_collections", {})
+                if isinstance(cfg_pcols, dict):
+                    state["portals_collections"] = cfg_pcols
+                    for name, cid in cfg_pcols.items():
+                        if name in portals_collections:
+                            portals_collections[name] = cid
+                cfg_addrs = cfg.get("getgems_addresses", {})
+                if isinstance(cfg_addrs, dict):
+                    state["getgems_addresses"] = cfg_addrs
+                    for name, addr in cfg_addrs.items():
+                        if name in getgems_addresses:
+                            getgems_addresses[name] = addr
 
                 raw_mode = cfg.get("sniper_mode", "buy")
                 if "автовыкуп" in str(raw_mode).lower():
@@ -141,7 +298,21 @@ def save_config():
             "margin": state["margin"],
             "delay": state["delay"],
             "offers_delay": state["offers_delay"],
-            "sniper_mode": state["sniper_mode"]
+            "sniper_mode": state["sniper_mode"],
+            "getgems_api_key": state["getgems_api_key"],
+            "getgems_running": state["getgems_running"],
+            "getgems_delay": state["getgems_delay"],
+            "getgems_autobuy": state["getgems_autobuy"],
+            "getgems_wallet_mnemonic": state["getgems_wallet_mnemonic"],
+            "getgems_max_buy_price": state["getgems_max_buy_price"],
+            "getgems_addresses": state["getgems_addresses"],
+            "ton_api_key": state["ton_api_key"],
+            "portals_token": state["portals_token"],
+            "portals_running": state["portals_running"],
+            "portals_delay": state["portals_delay"],
+            "portals_autobuy": state["portals_autobuy"],
+            "portals_max_buy_price": state["portals_max_buy_price"],
+            "portals_collections": state["portals_collections"],
         }
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -209,6 +380,514 @@ class ImpersonatedSession:
 session = ImpersonatedSession()
 
 # =====================================================================
+# GETGEMS (getgems.io) HTTP SESSION + LISTINGS
+# =====================================================================
+class GetGemsSession:
+    """
+    Thin client for getgems.io's GraphQL API.
+
+    An optional API key (config `getgems_api_key`) is sent as the Authorization
+    header when present. This is a best-effort client for an endpoint whose
+    exact query/response shape is UNVERIFIED — see the GETGEMS_* constants.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+
+    @property
+    def session(self):
+        if not hasattr(self._local, "session"):
+            if HAS_CURL_CFFI:
+                try:
+                    self._local.session = curl_requests.Session(impersonate="chrome124")
+                except Exception:
+                    self._local.session = curl_requests.Session()
+            else:
+                self._local.session = curl_requests.Session()
+        return self._local.session
+
+    def _headers(self):
+        headers = GETGEMS_HEADERS.copy()
+        with state_lock:
+            api_key = state["getgems_api_key"]
+        if api_key:
+            headers["Authorization"] = api_key
+        return headers
+
+    def graphql(self, query, variables, timeout=10):
+        payload = {"query": query, "variables": variables}
+        try:
+            return self.session.post(GETGEMS_GRAPHQL_URL, json=payload, headers=self._headers(), timeout=timeout)
+        except Exception as e:
+            log(f"[GetGems] GraphQL POST exception: {e}", "ERROR")
+            return None
+
+
+getgems_session = GetGemsSession()
+
+
+def getgems_get_address(collection_name):
+    """Resolve the configured GetGems contract address for a collection, or ''."""
+    with state_lock:
+        overrides = dict(state["getgems_addresses"])
+    return overrides.get(collection_name) or getgems_addresses.get(collection_name) or ""
+
+
+def _getgems_node_to_item(node):
+    """Normalize one GraphQL node into the bot's item shape (price in nanoTON)."""
+    if not isinstance(node, dict):
+        return None
+    sale = node.get("sale") or {}
+    full_price = sale.get("fullPrice") if isinstance(sale, dict) else None
+    if full_price is None:
+        full_price = node.get("price") or node.get("fullPrice")
+    if full_price is None:
+        return None
+    try:
+        price_nano = int(full_price)  # GetGems prices are nanoTON strings
+    except (TypeError, ValueError):
+        try:
+            price_nano = int(float(full_price) * 1e9)
+        except (TypeError, ValueError):
+            return None
+    if price_nano <= 0:
+        return None
+    item_address = node.get("address") or node.get("nftAddress")
+    sale_address = sale.get("address") if isinstance(sale, dict) else None
+    return {
+        "salePrice": price_nano,
+        "id": item_address,
+        "sale_address": sale_address,
+        "name": node.get("name") or node.get("title"),
+        "number": node.get("number") or node.get("index"),
+        "url": f"https://getgems.io/nft/{item_address}" if item_address else "https://getgems.io",
+    }
+
+
+def _getgems_parse_listings(body):
+    """
+    Normalize a GetGems GraphQL response into a list of item dicts.
+    Defensive against the exact (UNVERIFIED) field path by walking the response
+    for an `edges` list of `node` objects, or a plain list of items.
+    """
+    items = []
+
+    def _collect_edges(edges):
+        out = []
+        for e in edges:
+            node = e.get("node") if isinstance(e, dict) else None
+            it = _getgems_node_to_item(node if node is not None else e)
+            if it:
+                out.append(it)
+        return out
+
+    if isinstance(body, dict):
+        data = body.get("data", body)
+        # Find the first dict with an "edges" list anywhere one level down.
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, dict) and isinstance(v.get("edges"), list):
+                    items = _collect_edges(v["edges"])
+                    if items:
+                        return items
+                if isinstance(v, list):
+                    cand = _collect_edges(v)
+                    if cand:
+                        return cand
+        if isinstance(data.get("edges"), list):
+            return _collect_edges(data["edges"])
+    elif isinstance(body, list):
+        return _collect_edges(body)
+    return items
+
+
+def getgems_fetch_listings(collection_name, count=10):
+    """
+    Fetch the cheapest `count` fix-price listings for a collection from GetGems.
+    Requires the collection's contract address (set via /getgems_address).
+    Returns a normalized list (see _getgems_parse_listings).
+    """
+    address = getgems_get_address(collection_name)
+    if not address:
+        raise Exception("GETGEMS_NO_ADDRESS")
+
+    variables = {"address": address, "count": count}
+    r = getgems_session.graphql(GETGEMS_SEARCH_QUERY, variables)
+    if r is None:
+        raise Exception("GETGEMS_CONNECTION_FAILED")
+    if r.status_code == 429:
+        raise Exception("API_429")
+    if r.status_code in (401, 403):
+        raise Exception("GETGEMS_AUTH_REQUIRED")
+    if r.status_code != 200:
+        raise Exception(f"GETGEMS_ERROR_{r.status_code}")
+    try:
+        body = r.json()
+    except Exception:
+        raise Exception("GETGEMS_BAD_JSON")
+    if isinstance(body, dict) and body.get("errors"):
+        raise Exception(f"GETGEMS_GRAPHQL_ERROR: {body['errors']}")
+    return _getgems_parse_listings(body)
+
+
+# =====================================================================
+# GETGEMS AUTO-BUY (TON wallet transaction signing)
+# =====================================================================
+# GetGems is non-custodial: buying a fix-price sale = sending the price (+ gas)
+# to the sale CONTRACT address that comes with the listing. So auto-buy builds
+# the transaction from the listing itself (sale address + price) — not invented
+# values — then signs and broadcasts it with the configured wallet.
+#
+# SAFETY MODEL:
+#   • Disabled unless `getgems_autobuy` is True AND `getgems_max_buy_price` > 0.
+#   • Destination = the listing's sale contract address (from the API).
+#   • The item price must be within the price cap; total sent (price + gas) is
+#     also bounded by (cap + fee buffer) before signing.
+#   • The TON SDK (pytoniq) is imported lazily; if missing, auto-buy aborts
+#     cleanly and falls back to an alert (no broadcast).
+#
+# UNVERIFIED: GETGEMS_BUY_GAS_TON and the buy message body (sale-contract op).
+# Test with a cheap item and a low cap first.
+
+def toncenter_get_balance_nano(address):
+    """
+    Read a wallet's balance (in nanoTON) via toncenter's getAddressBalance.
+    Returns an int, or None if the API key is missing or the request fails.
+    Pure HTTPS — does not require the TON SDK.
+    """
+    with state_lock:
+        api_key = state["ton_api_key"]
+    if not api_key:
+        return None
+    try:
+        headers = {"Accept": "application/json", "X-API-Key": api_key}
+        resp = curl_requests.get(
+            f"{TONCENTER_API_BASE}/getAddressBalance",
+            params={"address": address},
+            headers=headers,
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            return None
+        return int(data.get("result"))
+    except Exception as e:
+        log(f"[TON] Balance check failed: {e}", "WARN")
+        return None
+
+
+def _ton_sign_and_send(messages, mnemonic):
+    """
+    Sign and broadcast the given TON transaction messages with the configured
+    wallet. `messages` = list of {"address", "amount_nano", "payload"|None}.
+    Uses pytoniq (lazy import). If a toncenter API key is configured, runs a
+    pre-flight balance check so we never sign a transfer the wallet can't cover.
+    Returns (success: bool, msg: str).
+    """
+    try:
+        from pytoniq import LiteBalancer, WalletV4R2  # type: ignore
+    except Exception:
+        return False, "TON SDK не установлен. Установите: pip install pytoniq"
+
+    words = mnemonic.strip().split()
+    if len(words) not in (12, 24):
+        return False, "BAD_MNEMONIC (ожидается 12 или 24 слова)"
+
+    import asyncio
+
+    total_nano = sum(int(m["amount_nano"]) for m in messages)
+
+    async def _run():
+        provider = LiteBalancer.from_mainnet_config(trust_level=2)
+        await provider.start_up()
+        try:
+            wallet = await WalletV4R2.from_mnemonic(provider, words)
+
+            # Pre-flight balance guard via toncenter (skipped if no API key).
+            try:
+                addr_str = wallet.address.to_str(is_user_friendly=True, is_bounceable=False)
+            except Exception:
+                addr_str = str(wallet.address)
+            balance = toncenter_get_balance_nano(addr_str)
+            if balance is not None and balance < total_nano:
+                return False, (
+                    f"INSUFFICIENT_FUNDS: баланс {balance/1e9:.3f} TON < "
+                    f"требуется {total_nano/1e9:.3f} TON — покупка отменена."
+                )
+
+            for m in messages:
+                await wallet.transfer(
+                    destination=m["address"],
+                    amount=m["amount_nano"],
+                    body=m.get("payload"),
+                )
+            return True, "SUCCESS"
+        finally:
+            await provider.close_all()
+
+    try:
+        return asyncio.run(_run())
+    except Exception as e:
+        return False, f"TON_SEND_ERROR: {e}"
+
+
+def getgems_execute_buy(item):
+    """
+    Full GetGems auto-buy flow with safety guards. Returns (success, message).
+    """
+    with state_lock:
+        autobuy = state["getgems_autobuy"]
+        mnemonic = state["getgems_wallet_mnemonic"]
+        max_price = state["getgems_max_buy_price"]
+
+    if not autobuy:
+        return False, "AUTOBUY_DISABLED"
+    if max_price <= 0:
+        return False, "NO_PRICE_CAP (установите /getgems_maxprice)"
+    if not mnemonic:
+        return False, "NO_WALLET (установите /getgems_wallet)"
+
+    price_ton = float(item.get("salePrice", 0)) / 1e9
+    if price_ton <= 0:
+        return False, "BAD_PRICE"
+    if price_ton > max_price:
+        return False, f"PRICE_ABOVE_CAP ({price_ton:.3f} > {max_price:.3f} TON)"
+
+    sale_address = item.get("sale_address")
+    if not sale_address:
+        return False, "NO_SALE_ADDRESS (нет адреса контракта продажи в листинге)"
+
+    # Build the buy transaction: send price + gas to the sale contract.
+    total_nano = item.get("salePrice", 0) + int(GETGEMS_BUY_GAS_TON * 1e9)
+
+    # Hard guard: total value must not exceed cap + fee buffer.
+    limit_nano = int((max_price + GETGEMS_TX_FEE_BUFFER_TON) * 1e9)
+    if total_nano > limit_nano:
+        return False, (
+            f"TX_VALUE_OVER_LIMIT: транзакция на {total_nano/1e9:.3f} TON превышает "
+            f"лимит {limit_nano/1e9:.3f} TON — покупка отменена ради безопасности."
+        )
+
+    messages = [{"address": str(sale_address), "amount_nano": total_nano, "payload": None}]
+    return _ton_sign_and_send(messages, mnemonic)
+
+
+# =====================================================================
+# PORTALS (portals-market.com) HTTP SESSION + LISTINGS + BUY
+# =====================================================================
+class PortalsSession:
+    """
+    Thin client for portals-market.com's REST API. The auth token (config
+    `portals_token`, set via /portals_token) is sent as the Authorization
+    header. Endpoint shapes are UNVERIFIED — see the PORTALS_* constants.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+
+    @property
+    def session(self):
+        if not hasattr(self._local, "session"):
+            if HAS_CURL_CFFI:
+                try:
+                    self._local.session = curl_requests.Session(impersonate="chrome124")
+                except Exception:
+                    self._local.session = curl_requests.Session()
+            else:
+                self._local.session = curl_requests.Session()
+        return self._local.session
+
+    def _headers(self):
+        headers = PORTALS_HEADERS.copy()
+        with state_lock:
+            token = state["portals_token"]
+        if token:
+            # Portals expects a Telegram-Mini-App auth string. Pass the token
+            # as-is if the user already included a scheme (e.g. "tma ..."),
+            # otherwise default to the "tma" scheme.
+            headers["Authorization"] = token if " " in token else f"tma {token}"
+        return headers
+
+    def get(self, path, params=None, timeout=8):
+        url = f"{PORTALS_API_BASE}{path}"
+        try:
+            return self.session.get(url, params=params, headers=self._headers(), timeout=timeout)
+        except Exception as e:
+            log(f"[Portals] GET exception to {url}: {e}", "ERROR")
+            return None
+
+    def post(self, path, json_data, timeout=8):
+        url = f"{PORTALS_API_BASE}{path}"
+        try:
+            return self.session.post(url, json=json_data, headers=self._headers(), timeout=timeout)
+        except Exception as e:
+            log(f"[Portals] POST exception to {url}: {e}", "ERROR")
+            return None
+
+
+portals_session = PortalsSession()
+
+
+def portals_get_collection_id(collection_name):
+    """Resolve the configured Portals collection id for a name, or ''."""
+    with state_lock:
+        overrides = dict(state["portals_collections"])
+    return overrides.get(collection_name) or portals_collections.get(collection_name) or ""
+
+
+def _portals_price_to_nano(value):
+    """Normalize a Portals price (TON decimal string/number) to nanoTON int."""
+    if value is None:
+        return 0
+    try:
+        ton = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if ton <= 0:
+        return 0
+    return int(round(ton * 1e9))
+
+
+def _portals_item_to_item(node):
+    """Normalize one Portals listing into the bot's item shape (price in nanoTON)."""
+    if not isinstance(node, dict):
+        return None
+    price_raw = node.get("price")
+    if price_raw is None:
+        price_raw = node.get("amount") or node.get("floor_price")
+    price_nano = _portals_price_to_nano(price_raw)
+    if price_nano <= 0:
+        return None
+    nft_id = node.get("id") or node.get("nft_id") or node.get("nftId")
+    collection = node.get("collection_name")
+    coll_obj = node.get("collection")
+    if not collection and isinstance(coll_obj, dict):
+        collection = coll_obj.get("name")
+    number = node.get("external_collection_number") or node.get("number") or node.get("num")
+    return {
+        "salePrice": price_nano,
+        "id": nft_id,
+        "name": node.get("name") or node.get("title"),
+        "number": number,
+        "collectionName": collection,
+        "url": f"https://t.me/portals/market?startapp={nft_id}" if nft_id else "https://portals-market.com",
+    }
+
+
+def _portals_parse_listings(body):
+    """
+    Normalize a Portals search response into a list of item dicts. Defensive
+    against the exact (UNVERIFIED) field path: accepts a plain list or a dict
+    holding a list under a common key.
+    """
+    raw = []
+    if isinstance(body, list):
+        raw = body
+    elif isinstance(body, dict):
+        for key in ("results", "nfts", "items", "data", "list"):
+            v = body.get(key)
+            if isinstance(v, list):
+                raw = v
+                break
+        else:
+            for v in body.values():
+                if isinstance(v, list):
+                    raw = v
+                    break
+    out = []
+    for node in raw:
+        it = _portals_item_to_item(node)
+        if it:
+            out.append(it)
+    return out
+
+
+def portals_fetch_listings(collection_name, count=10):
+    """
+    Fetch the cheapest `count` listed items for a collection from Portals.
+    Sorted price-ascending. Returns a normalized list (see _portals_parse_listings).
+    """
+    params = {
+        "offset": 0,
+        "limit": count,
+        "sort_by": "price asc",
+        "status": "listed",
+    }
+    cid = portals_get_collection_id(collection_name)
+    # Filter by configured id when available, else by collection name.
+    params["filter_by_collections"] = cid if cid else collection_name
+
+    r = portals_session.get(PORTALS_SEARCH_PATH, params=params)
+    if r is None:
+        raise Exception("PORTALS_CONNECTION_FAILED")
+    if r.status_code == 429:
+        raise Exception("API_429")
+    if r.status_code in (401, 403):
+        raise Exception("PORTALS_AUTH_REQUIRED")
+    if r.status_code != 200:
+        raise Exception(f"PORTALS_ERROR_{r.status_code}")
+    try:
+        body = r.json()
+    except Exception:
+        raise Exception("PORTALS_BAD_JSON")
+    return _portals_parse_listings(body)
+
+
+def portals_execute_buy(item):
+    """
+    Full Portals auto-buy flow with safety guards. Buying is a single
+    authenticated API call (custodial balance) — no wallet signing.
+    Returns (success, message).
+    """
+    with state_lock:
+        autobuy = state["portals_autobuy"]
+        token = state["portals_token"]
+        max_price = state["portals_max_buy_price"]
+
+    if not autobuy:
+        return False, "AUTOBUY_DISABLED"
+    if not token:
+        return False, "NO_TOKEN (установите /portals_token)"
+    if max_price <= 0:
+        return False, "NO_PRICE_CAP (установите /portals_maxprice)"
+
+    price_ton = float(item.get("salePrice", 0)) / 1e9
+    if price_ton <= 0:
+        return False, "BAD_PRICE"
+    if price_ton > max_price:
+        return False, f"PRICE_ABOVE_CAP ({price_ton:.3f} > {max_price:.3f} TON)"
+
+    nft_id = item.get("id")
+    if not nft_id:
+        return False, "NO_NFT_ID"
+
+    # Confirm the exact price we saw, so a server-side price change cancels the buy.
+    payload = {"nft_id": nft_id, "price": round(price_ton, 4)}
+    r = portals_session.post(PORTALS_BUY_PATH, payload)
+    if r is None:
+        return False, "CONNECTION_ERROR"
+
+    if r.status_code in (200, 201):
+        # Portals may embed an error inside a 200 body — inspect it.
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            err = body.get("error") or body.get("message") or body.get("detail")
+            if err and not (body.get("success") or body.get("ok")):
+                return False, str(err)
+        return True, "SUCCESS"
+    if r.status_code in (401, 403):
+        return False, "AUTH_REQUIRED (обновите /portals_token)"
+    try:
+        err = r.json().get("message") or r.text[:200]
+    except Exception:
+        err = f"HTTP_{r.status_code}"
+    return False, str(err)
+
+
+# =====================================================================
 # TELEGRAM BOT INTEGRATION (LONG POLLING)
 # =====================================================================
 class TelegramBot:
@@ -266,9 +945,10 @@ class TelegramBot:
 
         cmd = cmd.lower()
         if cmd == "/start" or cmd == "/help":
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
             help_text = (
                 "🤖 <b>MRKT Sniper Bot</b>\n\n"
-                "Снайпер запущен и готов к работе. Настройки коллекции: <b>Vice Cream</b> и <b>Chill Flame</b>.\n\n"
+                f"Снайпер запущен и готов к работе. Отслеживаемые коллекции: {collections_str}.\n\n"
                 "<b>Доступные команды:</b>\n"
                 "📊 /status - Проверить текущий статус и флор-цены\n"
                 "💰 /margin &lt;число&gt; - Установить мин. профит / скидку оффера в TON (например: <code>/margin 0.2</code>)\n"
@@ -281,6 +961,24 @@ class TelegramBot:
                 "🛑 /stop_sniper - Остановить снайпер\n"
                 "✉️ /offers_on - Включить авто-офферы (ниже флора на margin TON)\n"
                 "❌ /offers_off - Выключить авто-офферы\n"
+                "\n<b>💎 GetGems (getgems.io):</b>\n"
+                "🔑 /getgems_apikey &lt;ключ&gt; - (Опц.) API-ключ getgems.io\n"
+                "🏷 /getgems_address &lt;коллекция&gt; &lt;адрес&gt; - Задать контракт коллекции\n"
+                "💎 /getgems_on - Включить мониторинг GetGems (флор + алерты)\n"
+                "💎 /getgems_off - Выключить мониторинг GetGems\n"
+                "👛 /getgems_wallet &lt;сид-фраза&gt; - Кошелёк для автовыкупа (12/24 слова)\n"
+                "🎯 /getgems_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
+                "⚡ /getgems_autobuy_on - Включить автовыкуп GetGems\n"
+                "🛑 /getgems_autobuy_off - Выключить автовыкуп GetGems\n"
+                "🔗 /ton_apikey &lt;ключ&gt; - API-ключ toncenter (баланс перед автовыкупом)\n"
+                "\n<b>💠 Portals (portals-market.com):</b>\n"
+                "🔑 /portals_token &lt;токен&gt; - Авторизация portals-market.com\n"
+                "🏷 /portals_collection &lt;коллекция&gt; &lt;id&gt; - (Опц.) id коллекции\n"
+                "💠 /portals_on - Включить мониторинг Portals (флор + алерты)\n"
+                "💠 /portals_off - Выключить мониторинг Portals\n"
+                "🎯 /portals_maxprice &lt;TON&gt; - Лимит цены автовыкупа (0 = выкл)\n"
+                "⚡ /portals_autobuy_on - Включить автовыкуп Portals\n"
+                "🛑 /portals_autobuy_off - Выключить автовыкуп Portals\n\n"
                 "🧪 /test - Запустить тестовый запрос и вывести флор прямо сейчас"
             )
             self.send_message(help_text)
@@ -294,34 +992,72 @@ class TelegramBot:
             with state_lock:
                 running_status = "🟢 АКТИВЕН" if state["running"] else "🔴 ОСТАНОВЛЕН"
                 offers_status = "🟢 ВКЛЮЧЕНЫ" if state["offers_running"] else "🔴 ВЫКЛЮЧЕНЫ"
+                getgems_status = "🟢 ВКЛЮЧЕН" if state["getgems_running"] else "🔴 ВЫКЛЮЧЕН"
+                getgems_autobuy_status = "🟢 ВКЛЮЧЕН" if state["getgems_autobuy"] else "🔴 ВЫКЛЮЧЕН"
+                getgems_cap = state["getgems_max_buy_price"]
+                getgems_wallet_set = "Задан" if state["getgems_wallet_mnemonic"] else "Отсутствует"
                 mode_str = "Выкуп + Уведомление" if state["sniper_mode"] == "buy" else "Только Уведомление"
                 margin_val = state["margin"]
                 delay_val = state["delay"]
                 offers_delay_val = state["offers_delay"]
                 token_preview = f"{state['auth_token'][:6]}...{state['auth_token'][-6:]}" if state["auth_token"] else "Отсутствует"
+                getgems_auth = "Задан" if state["getgems_api_key"] else "Отсутствует"
+                ton_api_set = "Задан" if state["ton_api_key"] else "Отсутствует"
+                portals_status = "🟢 ВКЛЮЧЕН" if state["portals_running"] else "🔴 ВЫКЛЮЧЕН"
+                portals_autobuy_status = "🟢 ВКЛЮЧЕН" if state["portals_autobuy"] else "🔴 ВЫКЛЮЧЕН"
+                portals_cap = state["portals_max_buy_price"]
+                portals_auth = "Задан" if state["portals_token"] else "Отсутствует"
 
-            floor_vc = f"{stable_floors['Vice Cream']:.2f} TON" if stable_floors['Vice Cream'] else "Не определен"
-            floor_cf = f"{stable_floors['Chill Flame']:.2f} TON" if stable_floors['Chill Flame'] else "Не определен"
+            floor_lines = []
+            offer_lines = []
+            getgems_floor_lines = []
+            portals_floor_lines = []
+            for c in TARGET_COLLECTIONS:
+                floor_val = stable_floors.get(c)
+                floor_str = f"{floor_val:.2f} TON" if floor_val else "Не определен"
+                floor_lines.append(f"• {c}: <b>{floor_str}</b>")
 
-            placed_vc = f"{placed_offers.get('Vice Cream', 0):.2f} TON" if placed_offers.get('Vice Cream') else "—"
-            placed_cf = f"{placed_offers.get('Chill Flame', 0):.2f} TON" if placed_offers.get('Chill Flame') else "—"
+                placed_val = placed_offers.get(c)
+                placed_str = f"{placed_val:.2f} TON" if placed_val else "—"
+                offer_lines.append(f"• {c}: <code>{placed_str}</code>")
+
+                gg_val = getgems_floors.get(c)
+                gg_str = f"{gg_val:.2f} TON" if gg_val else "Не определен"
+                getgems_floor_lines.append(f"• {c}: <b>{gg_str}</b>")
+
+                p_val = portals_floors.get(c)
+                p_str = f"{p_val:.2f} TON" if p_val else "Не определен"
+                portals_floor_lines.append(f"• {c}: <b>{p_str}</b>")
+
+            floors_block = "\n".join(floor_lines)
+            offers_block = "\n".join(offer_lines)
+            getgems_floors_block = "\n".join(getgems_floor_lines)
+            portals_floors_block = "\n".join(portals_floor_lines)
 
             status_text = (
                 f"📊 <b>Текущий статус снайпера:</b>\n"
                 f"• Режим работы: <b>{running_status}</b>\n"
                 f"• Тип снайпера: <code>{mode_str}</code>\n"
                 f"• Авто-офферы: <b>{offers_status}</b>\n"
+                f"• GetGems-мониторинг: <b>{getgems_status}</b>\n"
+                f"• GetGems-автовыкуп: <b>{getgems_autobuy_status}</b> (лимит {getgems_cap} TON, кошелёк: {getgems_wallet_set})\n"
+                f"• Portals-мониторинг: <b>{portals_status}</b>\n"
+                f"• Portals-автовыкуп: <b>{portals_autobuy_status}</b> (лимит {portals_cap} TON, токен: {portals_auth})\n"
                 f"• Мин. профит / скидка оффера: <code>{margin_val} TON</code>\n"
                 f"• Интервал опроса: <code>{delay_val} сек</code>\n"
                 f"• Интервал офферов: <code>{offers_delay_val} сек</code>\n"
                 f"• Токен MRKT: <code>{token_preview}</code>\n"
+                f"• API-ключ GetGems: <code>{getgems_auth}</code>\n"
+                f"• TON API (toncenter): <code>{ton_api_set}</code>\n"
                 f"• Время работы: <code>{uptime_str}</code>\n\n"
-                f"📈 <b>Рыночный флор (анализ 6 минут):</b>\n"
-                f"• Vice Cream: <b>{floor_vc}</b>\n"
-                f"• Chill Flame: <b>{floor_cf}</b>\n\n"
+                f"📈 <b>Рыночный флор (MRKT):</b>\n"
+                f"{floors_block}\n\n"
+                f"💎 <b>Флор GetGems:</b>\n"
+                f"{getgems_floors_block}\n\n"
+                f"💠 <b>Флор Portals:</b>\n"
+                f"{portals_floors_block}\n\n"
                 f"✉️ <b>Последние выставленные офферы:</b>\n"
-                f"• Vice Cream: <code>{placed_vc}</code>\n"
-                f"• Chill Flame: <code>{placed_cf}</code>\n\n"
+                f"{offers_block}\n\n"
                 f"⚙️ <b>Статистика:</b>\n"
                 f"• Проверено лотов: <code>{stats['scans']}</code>\n"
                 f"• Успешных покупок: <code>{stats['buys']}</code>\n"
@@ -427,9 +1163,10 @@ class TelegramBot:
             save_config()
             with state_lock:
                 margin_v = state["margin"]
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
             self.send_message(
                 f"✅ <b>Авто-офферы включены!</b>\n"
-                f"Бот будет выставлять офферы на <b>Vice Cream</b> и <b>Chill Flame</b>\n"
+                f"Бот будет выставлять офферы на {collections_str}\n"
                 f"ниже рыночного флора на <b>{margin_v} TON</b>.\n"
                 f"Защита от скама активна — оффер всегда ставится относительно реального флора, "
                 f"а не цены отдельного листинга."
@@ -443,38 +1180,360 @@ class TelegramBot:
             self.send_message("🛑 <b>Авто-офферы выключены.</b>")
             log("Auto-offers mode DISABLED via Telegram command.")
 
+        elif cmd == "/getgems_apikey":
+            if not args:
+                self.send_message(
+                    "❌ Укажите API-ключ getgems.io. Пример:\n"
+                    "<code>/getgems_apikey &lt;ключ&gt;</code>"
+                )
+                return
+            new_key = " ".join(args).strip()
+            with state_lock:
+                state["getgems_api_key"] = new_key
+            save_config()
+            self.send_message("✅ API-ключ GetGems сохранён.")
+
+        elif cmd == "/getgems_address":
+            if len(args) < 2:
+                self.send_message(
+                    "❌ Укажите коллекцию и адрес контракта. Пример:\n"
+                    "<code>/getgems_address Vice Cream EQ...</code>\n"
+                    f"Доступные коллекции: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            # Address is the last token; everything before it is the collection name.
+            addr = args[-1].strip()
+            name_input = " ".join(args[:-1]).strip()
+            match = None
+            for c in TARGET_COLLECTIONS:
+                if c.lower() == name_input.lower():
+                    match = c
+                    break
+            if not match:
+                self.send_message(
+                    f"❌ Неизвестная коллекция «{name_input}».\n"
+                    f"Доступные: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            with state_lock:
+                overrides = dict(state["getgems_addresses"])
+                overrides[match] = addr
+                state["getgems_addresses"] = overrides
+            getgems_addresses[match] = addr
+            save_config()
+            self.send_message(f"✅ Адрес контракта для <b>{match}</b> сохранён:\n<code>{addr}</code>")
+
+        elif cmd == "/getgems_on":
+            missing = [c for c in TARGET_COLLECTIONS if not getgems_get_address(c)]
+            if missing:
+                self.send_message(
+                    "⚠️ Не заданы адреса контрактов для: "
+                    + ", ".join(missing)
+                    + ".\nЭти коллекции будут пропущены. Задайте их командой "
+                    "<code>/getgems_address &lt;коллекция&gt; &lt;адрес&gt;</code>."
+                )
+            with state_lock:
+                state["getgems_running"] = True
+            save_config()
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
+            self.send_message(
+                f"✅ <b>Мониторинг GetGems включён!</b>\n"
+                f"Считаю флор и слежу за рынком на {collections_str}.\n"
+                f"⚠️ Автовыкуп на GetGems требует подписи TON-транзакции — "
+                f"включите его отдельно через <code>/getgems_autobuy_on</code>."
+            )
+            log("GetGems monitoring ENABLED via Telegram command.")
+
+        elif cmd == "/getgems_off":
+            with state_lock:
+                state["getgems_running"] = False
+            save_config()
+            self.send_message("🛑 <b>Мониторинг GetGems выключен.</b>")
+            log("GetGems monitoring DISABLED via Telegram command.")
+
+        elif cmd == "/getgems_wallet":
+            if not args:
+                self.send_message(
+                    "❌ Укажите сид-фразу кошелька (12 или 24 слова) для автовыкупа GetGems.\n"
+                    "⚠️ <b>Внимание:</b> фраза хранится в config.json в открытом виде — "
+                    "используйте отдельный кошелёк с небольшим балансом."
+                )
+                return
+            words = args
+            if len(words) not in (12, 24):
+                self.send_message("❌ Сид-фраза должна состоять из 12 или 24 слов.")
+                return
+            with state_lock:
+                state["getgems_wallet_mnemonic"] = " ".join(words)
+            save_config()
+            self.send_message(
+                "✅ Кошелёк GetGems сохранён.\n"
+                "⚠️ Рекомендуется удалить это сообщение из чата — оно содержит сид-фразу."
+            )
+
+        elif cmd == "/getgems_maxprice":
+            if not args:
+                self.send_message("❌ Укажите макс. цену покупки в TON. Пример: <code>/getgems_maxprice 5</code>")
+                return
+            try:
+                val = float(args[0])
+                if val < 0:
+                    self.send_message("❌ Цена не может быть отрицательной.")
+                    return
+                with state_lock:
+                    state["getgems_max_buy_price"] = val
+                save_config()
+                if val == 0:
+                    self.send_message("✅ Лимит сброшен в 0 — автовыкуп GetGems не будет покупать, пока не зададите лимит > 0.")
+                else:
+                    self.send_message(f"✅ Макс. цена автовыкупа GetGems: <b>{val} TON</b>.")
+            except ValueError:
+                self.send_message("❌ Неверный формат числа.")
+
+        elif cmd == "/getgems_autobuy_on":
+            with state_lock:
+                has_wallet = bool(state["getgems_wallet_mnemonic"])
+                cap = state["getgems_max_buy_price"]
+            if not has_wallet:
+                self.send_message("❌ Сначала задайте кошелёк: <code>/getgems_wallet &lt;сид-фраза&gt;</code>.")
+                return
+            if cap <= 0:
+                self.send_message("❌ Сначала задайте лимит цены: <code>/getgems_maxprice &lt;TON&gt;</code>.")
+                return
+            with state_lock:
+                state["getgems_autobuy"] = True
+            save_config()
+            self.send_message(
+                f"⚡ <b>Автовыкуп GetGems ВКЛЮЧЁН.</b>\n"
+                f"• Лимит цены: <b>{cap} TON</b>\n"
+                f"• Бот подпишет транзакцию покупки вашим кошельком при выгодном лоте.\n"
+                f"⚠️ Эндпоинты покупки GetGems не проверены — протестируйте на дешёвом лоте с низким лимитом."
+            )
+            log("GetGems auto-buy ENABLED via Telegram command.")
+
+        elif cmd == "/getgems_autobuy_off":
+            with state_lock:
+                state["getgems_autobuy"] = False
+            save_config()
+            self.send_message("🛑 <b>Автовыкуп GetGems выключен.</b>")
+            log("GetGems auto-buy DISABLED via Telegram command.")
+
+        elif cmd == "/ton_apikey":
+            if not args:
+                self.send_message(
+                    "❌ Укажите API-ключ toncenter.io. Пример:\n"
+                    "<code>/ton_apikey &lt;ключ&gt;</code>"
+                )
+                return
+            new_key = args[0].strip()
+            with state_lock:
+                state["ton_api_key"] = new_key
+            save_config()
+            self.send_message(
+                "✅ TON API-ключ (toncenter) сохранён.\n"
+                "Используется для проверки баланса кошелька перед автовыкупом."
+            )
+            log("TON API key updated via Telegram command.")
+
+        elif cmd == "/portals_token":
+            if not args:
+                self.send_message(
+                    "❌ Укажите токен авторизации portals-market.com. Пример:\n"
+                    "<code>/portals_token &lt;токен&gt;</code>\n"
+                    "Можно передать и полную строку (например <code>tma ...</code>)."
+                )
+                return
+            new_token = " ".join(args).strip()
+            with state_lock:
+                state["portals_token"] = new_token
+            save_config()
+            self.send_message(
+                "✅ Токен Portals сохранён.\n"
+                "⚠️ Рекомендуется удалить это сообщение — оно содержит токен."
+            )
+            log("Portals token updated via Telegram command.")
+
+        elif cmd == "/portals_collection":
+            if len(args) < 2:
+                self.send_message(
+                    "❌ Укажите коллекцию и id. Пример:\n"
+                    "<code>/portals_collection Vice Cream &lt;id&gt;</code>\n"
+                    f"Доступные коллекции: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            cid = args[-1].strip()
+            name_input = " ".join(args[:-1]).strip()
+            match = None
+            for c in TARGET_COLLECTIONS:
+                if c.lower() == name_input.lower():
+                    match = c
+                    break
+            if not match:
+                self.send_message(
+                    f"❌ Неизвестная коллекция «{name_input}».\n"
+                    f"Доступные: {', '.join(TARGET_COLLECTIONS)}"
+                )
+                return
+            with state_lock:
+                overrides = dict(state["portals_collections"])
+                overrides[match] = cid
+                state["portals_collections"] = overrides
+            portals_collections[match] = cid
+            save_config()
+            self.send_message(f"✅ id коллекции <b>{match}</b> сохранён:\n<code>{cid}</code>")
+
+        elif cmd == "/portals_on":
+            with state_lock:
+                token = state["portals_token"]
+            if not token:
+                self.send_message(
+                    "⚠️ Токен Portals не задан. Сначала задайте его командой "
+                    "<code>/portals_token &lt;токен&gt;</code>, иначе данные могут быть недоступны."
+                )
+            with state_lock:
+                state["portals_running"] = True
+            save_config()
+            collections_str = ", ".join(f"<b>{c}</b>" for c in TARGET_COLLECTIONS)
+            self.send_message(
+                f"✅ <b>Мониторинг Portals включён!</b>\n"
+                f"Считаю флор и слежу за рынком на {collections_str}.\n"
+                f"⚡ Автовыкуп через API: включить отдельно командой <code>/portals_autobuy_on</code>."
+            )
+            log("Portals monitoring ENABLED via Telegram command.")
+
+        elif cmd == "/portals_off":
+            with state_lock:
+                state["portals_running"] = False
+            save_config()
+            self.send_message("🛑 <b>Мониторинг Portals выключен.</b>")
+            log("Portals monitoring DISABLED via Telegram command.")
+
+        elif cmd == "/portals_maxprice":
+            if not args:
+                self.send_message("❌ Укажите макс. цену покупки в TON. Пример: <code>/portals_maxprice 5</code>")
+                return
+            try:
+                val = float(args[0])
+                if val < 0:
+                    self.send_message("❌ Цена не может быть отрицательной.")
+                    return
+                with state_lock:
+                    state["portals_max_buy_price"] = val
+                save_config()
+                if val == 0:
+                    self.send_message("✅ Лимит сброшен в 0 — автовыкуп Portals не будет покупать, пока не зададите лимит > 0.")
+                else:
+                    self.send_message(f"✅ Макс. цена автовыкупа Portals: <b>{val} TON</b>.")
+            except ValueError:
+                self.send_message("❌ Неверный формат числа.")
+
+        elif cmd == "/portals_autobuy_on":
+            with state_lock:
+                has_token = bool(state["portals_token"])
+                cap = state["portals_max_buy_price"]
+            if not has_token:
+                self.send_message("❌ Сначала задайте токен: <code>/portals_token &lt;токен&gt;</code>.")
+                return
+            if cap <= 0:
+                self.send_message("❌ Сначала задайте лимит цены: <code>/portals_maxprice &lt;TON&gt;</code>.")
+                return
+            with state_lock:
+                state["portals_autobuy"] = True
+            save_config()
+            self.send_message(
+                f"⚡ <b>Автовыкуп Portals ВКЛЮЧЁН.</b>\n"
+                f"• Лимит цены: <b>{cap} TON</b>\n"
+                f"• Покупка идёт через API Portals (баланс аккаунта).\n"
+                f"⚠️ Эндпоинты покупки Portals не проверены — протестируйте на дешёвом лоте с низким лимитом."
+            )
+            log("Portals auto-buy ENABLED via Telegram command.")
+
+        elif cmd == "/portals_autobuy_off":
+            with state_lock:
+                state["portals_autobuy"] = False
+            save_config()
+            self.send_message("🛑 <b>Автовыкуп Portals выключен.</b>")
+            log("Portals auto-buy DISABLED via Telegram command.")
+
         elif cmd == "/test":
             self.send_message("⏳ Выполняю тестовый анализ рынка...")
             threading.Thread(target=self._run_market_test, daemon=True).start()
 
     def _run_market_test(self):
         try:
-            vc_listings = fetch_listings("Vice Cream", count=10)
-            cf_listings = fetch_listings("Chill Flame", count=10)
-            
-            vc_floor = calculate_stable_floor(vc_listings)
-            cf_floor = calculate_stable_floor(cf_listings)
-            
-            vc_floor_str = f"<b>{vc_floor:.2f} TON</b>" if vc_floor else "Не найдено лотов"
-            cf_floor_str = f"<b>{cf_floor:.2f} TON</b>" if cf_floor else "Не найдено лотов"
-            
-            # Print cheap listing preview
-            vc_cheapest = f"{float(vc_listings[0]['salePrice'])/1e9:.2f} TON" if vc_listings else "Нет"
-            cf_cheapest = f"{float(cf_listings[0]['salePrice'])/1e9:.2f} TON" if cf_listings else "Нет"
-            
+            blocks = []
+            for col in TARGET_COLLECTIONS:
+                listings = fetch_listings(col, count=10)
+                floor = calculate_stable_floor(listings)
+                floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
+                cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
+                blocks.append(
+                    f"<b>{col}:</b>\n"
+                    f"• Стабильный флор: {floor_str}\n"
+                    f"• Самый дешевый лот: <code>{cheapest}</code>"
+                )
+
             res_text = (
-                f"🧪 <b>Результаты быстрого анализа:</b>\n\n"
-                f"🍦 <b>Vice Cream:</b>\n"
-                f"• Стабильный флор: {vc_floor_str}\n"
-                f"• Самый дешевый лот: <code>{vc_cheapest}</code>\n\n"
-                f"🔥 <b>Chill Flame:</b>\n"
-                f"• Стабильный флор: {cf_floor_str}\n"
-                f"• Самый дешевый лот: <code>{cf_cheapest}</code>\n\n"
-                f"🔌 <i>Соединение с MRKT API работает корректно!</i>"
+                "🧪 <b>Результаты быстрого анализа (MRKT):</b>\n\n"
+                + "\n\n".join(blocks)
+                + "\n\n🔌 <i>Соединение с MRKT API работает корректно!</i>"
             )
             self.send_message(res_text)
         except Exception as e:
-            self.send_message(f"❌ Ошибка тестирования рынка: <code>{e}</code>")
+            self.send_message(f"❌ Ошибка тестирования рынка MRKT: <code>{e}</code>")
+
+        # GetGems test (only if enabled / api key set) — isolated so MRKT result is unaffected.
+        with state_lock:
+            gg_enabled = state["getgems_running"] or bool(state["getgems_api_key"])
+        if gg_enabled:
+            try:
+                gg_blocks = []
+                for col in TARGET_COLLECTIONS:
+                    if not getgems_get_address(col):
+                        gg_blocks.append(f"<b>{col}:</b>\n• Адрес контракта не задан — пропуск")
+                        continue
+                    listings = getgems_fetch_listings(col, count=10)
+                    floor = calculate_stable_floor(listings)
+                    floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
+                    cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
+                    gg_blocks.append(
+                        f"<b>{col}:</b>\n"
+                        f"• Флор: {floor_str}\n"
+                        f"• Самый дешевый лот: <code>{cheapest}</code>"
+                    )
+                    time.sleep(0.3)
+                self.send_message(
+                    "💎 <b>Результаты анализа GetGems:</b>\n\n"
+                    + "\n\n".join(gg_blocks)
+                    + "\n\n🔌 <i>Соединение с GetGems работает.</i>"
+                )
+            except Exception as e:
+                self.send_message(f"❌ Ошибка тестирования GetGems: <code>{e}</code>")
+
+        # Portals test (only if enabled / token set) — isolated so MRKT result is unaffected.
+        with state_lock:
+            portals_enabled = state["portals_running"] or bool(state["portals_token"])
+        if portals_enabled:
+            try:
+                p_blocks = []
+                for col in TARGET_COLLECTIONS:
+                    listings = portals_fetch_listings(col, count=10)
+                    floor = calculate_stable_floor(listings)
+                    floor_str = f"<b>{floor:.2f} TON</b>" if floor else "Не найдено лотов"
+                    cheapest = f"{float(listings[0]['salePrice'])/1e9:.2f} TON" if listings else "Нет"
+                    p_blocks.append(
+                        f"<b>{col}:</b>\n"
+                        f"• Флор: {floor_str}\n"
+                        f"• Самый дешевый лот: <code>{cheapest}</code>"
+                    )
+                    time.sleep(0.3)
+                self.send_message(
+                    "💠 <b>Результаты анализа Portals:</b>\n\n"
+                    + "\n\n".join(p_blocks)
+                    + "\n\n🔌 <i>Соединение с Portals работает.</i>"
+                )
+            except Exception as e:
+                self.send_message(f"❌ Ошибка тестирования Portals: <code>{e}</code>")
 
     def updates_listener_loop(self):
         log("Telegram command listener thread started.")
@@ -736,26 +1795,379 @@ def floor_analyzer_loop():
     log("Floor analyzer started (60s refresh cycle).")
     while True:
         try:
-            vc_listings = fetch_listings("Vice Cream", count=10)
-            vc_floor    = calculate_stable_floor(vc_listings)
-
-            cf_listings = fetch_listings("Chill Flame", count=10)
-            cf_floor    = calculate_stable_floor(cf_listings)
+            computed = {}
+            for col in TARGET_COLLECTIONS:
+                listings = fetch_listings(col, count=10)
+                computed[col] = calculate_stable_floor(listings)
 
             with state_lock:
-                stable_floors["Vice Cream"]  = vc_floor
-                stable_floors["Chill Flame"] = cf_floor
-                state["last_analysis_time"]  = datetime.now()
+                for col, floor in computed.items():
+                    stable_floors[col] = floor
+                state["last_analysis_time"] = datetime.now()
 
-            vc_str = f"{vc_floor:.3f} TON" if vc_floor else "Нет лотов"
-            cf_str = f"{cf_floor:.3f} TON" if cf_floor else "Нет лотов"
-            log(f"Floors updated: Vice Cream={vc_str}  Chill Flame={cf_str}")
+            summary = "  ".join(
+                f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                for col, floor in computed.items()
+            )
+            log(f"Floors updated: {summary}")
 
         except Exception as e:
             log(f"Floor analyzer error: {e}", "ERROR")
             stats["errors"] += 1
 
         time.sleep(60)  # refresh every 60s — was 360s
+
+
+# =====================================================================
+# GETGEMS FLOOR ANALYZER + ALERT SNIPER
+# =====================================================================
+# Mirrors the MRKT sniper but for getgems.io, on the SAME collections.
+# Floor is computed with the identical calculate_stable_floor() algorithm.
+# Collections without a configured contract address are skipped.
+
+def getgems_floor_analyzer_loop():
+    """Refreshes the GetGems floor cache every 60s while GetGems mode is on."""
+    log("GetGems floor analyzer started (60s refresh cycle, paused until /getgems_on).")
+    while True:
+        with state_lock:
+            active = state["getgems_running"]
+        if not active:
+            time.sleep(3.0)
+            continue
+
+        try:
+            computed = {}
+            for col in TARGET_COLLECTIONS:
+                if not getgems_get_address(col):
+                    continue  # skip collections without a contract address
+                listings = getgems_fetch_listings(col, count=10)
+                computed[col] = calculate_stable_floor(listings)
+                time.sleep(0.5)  # gentle pacing between collections
+
+            with state_lock:
+                for col, floor in computed.items():
+                    getgems_floors[col] = floor
+
+            if computed:
+                summary = "  ".join(
+                    f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                    for col, floor in computed.items()
+                )
+                log(f"[GetGems] Floors updated: {summary}")
+
+        except Exception as e:
+            err_str = str(e)
+            if "GETGEMS_AUTH_REQUIRED" in err_str:
+                log("[GetGems] Auth required — set API key via /getgems_apikey. Pausing GetGems mode.", "ERROR")
+                tg_bot.send_message(
+                    "❌ <b>GetGems:</b> требуется авторизация. Задайте API-ключ командой "
+                    "<code>/getgems_apikey &lt;ключ&gt;</code> и снова включите <code>/getgems_on</code>."
+                )
+                with state_lock:
+                    state["getgems_running"] = False
+            else:
+                log(f"[GetGems] Floor analyzer error: {e}", "ERROR")
+                stats["errors"] += 1
+
+        time.sleep(60)
+
+
+def _getgems_buy_worker(item, col, name, price_ton, cached_floor, url):
+    """Runs GetGems auto-buy in a background thread and reports the result."""
+    profit = cached_floor - price_ton
+    log(f"[GetGems] 🚀 Auto-buy attempt: {name} @ {price_ton:.3f} TON")
+    try:
+        success, msg = getgems_execute_buy(item)
+    except Exception as e:
+        success, msg = False, str(e)
+
+    if success:
+        stats["buys"] += 1
+        log(f"[GetGems] ✅ BOUGHT: {name} @ {price_ton:.3f} TON")
+        tg_bot.send_message(
+            f"🎉 <b>GETGEMS: УСПЕШНЫЙ АВТОВЫКУП!</b>\n\n"
+            f"• Коллекция: <b>{col}</b>\n"
+            f"• NFT: <b>{name}</b>\n"
+            f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+            f"• Флор GetGems: <code>{cached_floor:.3f} TON</code>\n"
+            f"• 💰 Прибыль: <b>~{profit:.3f} TON</b>\n\n"
+            f"🔗 <a href='{url}'>Открыть на GetGems</a>"
+        )
+    else:
+        stats["errors"] += 1
+        log(f"[GetGems] ❌ Auto-buy failed: {name} | {msg}", "ERROR")
+        tg_bot.send_message(
+            f"🚨 <b>GETGEMS: автовыкуп не удался</b>\n\n"
+            f"• NFT: <b>{name}</b>\n"
+            f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+            f"• Причина: <code>{msg}</code>\n\n"
+            f"🔗 <a href='{url}'>Купить вручную</a>"
+        )
+
+
+def getgems_sniper_loop():
+    """
+    Fast-polling GetGems watcher. When a listing is priced at least `margin`
+    TON below the cached stable floor it sends a Telegram alert, and — if
+    GetGems auto-buy is enabled — fires a background buy in parallel.
+    """
+    log("GetGems sniper loop started (paused until /getgems_on).")
+    current_sleep = 5.0
+
+    while True:
+        with state_lock:
+            active = state["getgems_running"]
+            margin_limit = state["margin"]
+            poll_delay = state["getgems_delay"]
+
+        if not active:
+            time.sleep(3.0)
+            continue
+
+        try:
+            for col in TARGET_COLLECTIONS:
+                if not getgems_get_address(col):
+                    continue
+                with state_lock:
+                    cached_floor = getgems_floors.get(col)
+                if cached_floor is None:
+                    continue
+
+                listings = getgems_fetch_listings(col, count=5)
+                stats["scans"] += len(listings)
+                current_sleep = poll_delay
+
+                for item in listings:
+                    price_ton = float(item.get("salePrice", 0)) / 1e9
+                    if price_ton <= 0:
+                        continue
+                    real_profit = cached_floor - price_ton
+                    if real_profit < margin_limit:
+                        continue
+
+                    # Deduplicate by collection+price+number so we don't re-alert the same lot.
+                    number = item.get("number") or "?"
+                    dedup_key = f"getgems:{col}:{number}:{price_ton:.4f}"
+                    with alerted_lock:
+                        seen = dedup_key in alerted_ids
+                    if seen:
+                        continue
+                    add_alerted_id(dedup_key)
+
+                    stats["alerts"] += 1
+                    name = item.get("name") or f"{col} #{number}"
+                    url = item.get("url") or "https://getgems.io"
+                    log(f"[GetGems] 🔔 ALERT: {name} @ {price_ton:.3f} TON (floor {cached_floor:.3f}, profit {real_profit:.3f})")
+                    tg_bot.send_message(
+                        f"💎 <b>GETGEMS: дешёвый лот!</b>\n\n"
+                        f"• Коллекция: <b>{col}</b>\n"
+                        f"• NFT: <b>{name}</b>\n"
+                        f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+                        f"• Флор GetGems: <code>{cached_floor:.3f} TON</code>\n"
+                        f"• 💸 Выгода: <b>~{real_profit:.3f} TON</b>\n\n"
+                        f"🔗 <a href='{url}'>Открыть на GetGems</a>"
+                    )
+
+                    with state_lock:
+                        autobuy_on = state["getgems_autobuy"]
+                    if autobuy_on:
+                        threading.Thread(
+                            target=_getgems_buy_worker,
+                            args=(item, col, name, price_ton, cached_floor, url),
+                            daemon=True,
+                        ).start()
+
+                time.sleep(0.5)
+
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str:
+                stats["errors"] += 1
+                current_sleep = min(15.0, poll_delay * 2)
+                log(f"[GetGems] 429 rate limit — backing off {current_sleep:.1f}s.", "WARN")
+            elif "GETGEMS_AUTH_REQUIRED" in err_str:
+                log("[GetGems] Auth required — pausing GetGems mode.", "ERROR")
+                with state_lock:
+                    state["getgems_running"] = False
+            else:
+                stats["errors"] += 1
+                log(f"[GetGems] Sniper loop error: {e}", "ERROR")
+
+        time.sleep(current_sleep)
+
+
+# =====================================================================
+# PORTALS FLOOR ANALYZER + TURBO ALERT/BUY SNIPER
+# =====================================================================
+# Mirrors the MRKT sniper but for portals-market.com, on the SAME collections.
+# Floor uses the identical calculate_stable_floor() algorithm. Buying is a
+# single authenticated API call (custodial balance) — no wallet signing.
+
+def portals_floor_analyzer_loop():
+    """Refreshes the Portals floor cache every 60s while Portals mode is on."""
+    log("Portals floor analyzer started (60s refresh cycle, paused until /portals_on).")
+    while True:
+        with state_lock:
+            active = state["portals_running"]
+        if not active:
+            time.sleep(3.0)
+            continue
+
+        try:
+            computed = {}
+            for col in TARGET_COLLECTIONS:
+                listings = portals_fetch_listings(col, count=10)
+                computed[col] = calculate_stable_floor(listings)
+                time.sleep(0.3)  # gentle pacing between collections
+
+            with state_lock:
+                for col, floor in computed.items():
+                    portals_floors[col] = floor
+
+            summary = "  ".join(
+                f"{col}={f'{floor:.3f} TON' if floor else 'Нет лотов'}"
+                for col, floor in computed.items()
+            )
+            log(f"[Portals] Floors updated: {summary}")
+
+        except Exception as e:
+            err_str = str(e)
+            if "PORTALS_AUTH_REQUIRED" in err_str:
+                log("[Portals] Auth required — set token via /portals_token. Pausing Portals mode.", "ERROR")
+                tg_bot.send_message(
+                    "❌ <b>Portals:</b> требуется авторизация. Задайте токен командой "
+                    "<code>/portals_token &lt;токен&gt;</code> и снова включите <code>/portals_on</code>."
+                )
+                with state_lock:
+                    state["portals_running"] = False
+            else:
+                log(f"[Portals] Floor analyzer error: {e}", "ERROR")
+                stats["errors"] += 1
+
+        time.sleep(60)
+
+
+def _portals_buy_worker(item, col, name, price_ton, cached_floor, url):
+    """Fires Portals auto-buy in a background thread and reports the result."""
+    profit = cached_floor - price_ton
+    log(f"[Portals] 🚀 Auto-buy attempt: {name} @ {price_ton:.3f} TON")
+    try:
+        success, msg = portals_execute_buy(item)
+    except Exception as e:
+        success, msg = False, str(e)
+
+    if success:
+        stats["buys"] += 1
+        log(f"[Portals] ✅ BOUGHT: {name} @ {price_ton:.3f} TON")
+        tg_bot.send_message(
+            f"🎉 <b>PORTALS: УСПЕШНЫЙ АВТОВЫКУП!</b>\n\n"
+            f"• Коллекция: <b>{col}</b>\n"
+            f"• Подарок: <b>{name}</b>\n"
+            f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+            f"• Флор Portals: <code>{cached_floor:.3f} TON</code>\n"
+            f"• 💰 Прибыль: <b>~{profit:.3f} TON</b>\n\n"
+            f"🔗 <a href='{url}'>Открыть в Portals</a>"
+        )
+    else:
+        stats["errors"] += 1
+        skip_keywords = ("already", "sold", "not found", "unavailable", "AUTOBUY_DISABLED")
+        if not any(kw in str(msg).lower() for kw in (k.lower() for k in skip_keywords)):
+            log(f"[Portals] ❌ Auto-buy failed: {name} | {msg}", "ERROR")
+            tg_bot.send_message(
+                f"🚨 <b>PORTALS: автовыкуп не удался</b>\n\n"
+                f"• Подарок: <b>{name}</b>\n"
+                f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+                f"• Причина: <code>{msg}</code>\n\n"
+                f"🔗 <a href='{url}'>Купить вручную</a>"
+            )
+
+
+def portals_sniper_loop():
+    """
+    TURBO fast-polling Portals watcher. When a listing is priced at least
+    `margin` TON below the cached stable floor it sends an alert and — if
+    Portals auto-buy is enabled — fires a background buy in parallel.
+    """
+    log("Portals sniper loop started (paused until /portals_on).")
+    current_sleep = 1.5
+
+    while True:
+        with state_lock:
+            active = state["portals_running"]
+            margin_limit = state["margin"]
+            poll_delay = state["portals_delay"]
+
+        if not active:
+            time.sleep(2.0)
+            continue
+
+        try:
+            for col in TARGET_COLLECTIONS:
+                with state_lock:
+                    cached_floor = portals_floors.get(col)
+                if cached_floor is None:
+                    continue
+
+                listings = portals_fetch_listings(col, count=5)
+                stats["scans"] += len(listings)
+                current_sleep = poll_delay
+
+                for item in listings:
+                    price_ton = float(item.get("salePrice", 0)) / 1e9
+                    if price_ton <= 0:
+                        continue
+                    real_profit = cached_floor - price_ton
+                    if real_profit < margin_limit:
+                        continue
+
+                    number = item.get("number") or "?"
+                    dedup_key = f"portals:{col}:{number}:{price_ton:.4f}"
+                    with alerted_lock:
+                        seen = dedup_key in alerted_ids
+                    if seen:
+                        continue
+                    add_alerted_id(dedup_key)
+
+                    stats["alerts"] += 1
+                    name = item.get("name") or f"{col} #{number}"
+                    url = item.get("url") or "https://portals-market.com"
+                    log(f"[Portals] 🔔 ALERT: {name} @ {price_ton:.3f} TON (floor {cached_floor:.3f}, profit {real_profit:.3f})")
+                    tg_bot.send_message(
+                        f"💠 <b>PORTALS: дешёвый лот!</b>\n\n"
+                        f"• Коллекция: <b>{col}</b>\n"
+                        f"• Подарок: <b>{name}</b>\n"
+                        f"• Цена: <code>{price_ton:.3f} TON</code>\n"
+                        f"• Флор Portals: <code>{cached_floor:.3f} TON</code>\n"
+                        f"• 💸 Выгода: <b>~{real_profit:.3f} TON</b>\n\n"
+                        f"🔗 <a href='{url}'>Открыть в Portals</a>"
+                    )
+
+                    with state_lock:
+                        autobuy_on = state["portals_autobuy"]
+                    if autobuy_on:
+                        threading.Thread(
+                            target=_portals_buy_worker,
+                            args=(item, col, name, price_ton, cached_floor, url),
+                            daemon=True,
+                        ).start()
+
+                time.sleep(0.3)
+
+        except Exception as e:
+            err_str = str(e)
+            if "API_429" in err_str:
+                stats["errors"] += 1
+                current_sleep = min(12.0, poll_delay * 2)
+                log(f"[Portals] 429 rate limit — backing off {current_sleep:.1f}s.", "WARN")
+            elif "PORTALS_AUTH_REQUIRED" in err_str:
+                log("[Portals] Auth required — pausing Portals mode.", "ERROR")
+                with state_lock:
+                    state["portals_running"] = False
+            else:
+                stats["errors"] += 1
+                log(f"[Portals] Sniper loop error: {e}", "ERROR")
+
+        time.sleep(current_sleep)
 
 
 # =====================================================================
@@ -842,8 +2254,8 @@ def sniper_loop():
             continue
 
         try:
-            # Combined query (only 1 request to check both target collections)
-            gifts = fetch_combined_listings(["Vice Cream", "Chill Flame"], count=15)
+            # Combined query (only 1 request to check all target collections)
+            gifts = fetch_combined_listings(TARGET_COLLECTIONS, count=30)
             stats["scans"] += len(gifts)
             
             # Reset backoff counters on success
@@ -869,7 +2281,7 @@ def sniper_loop():
                     continue
 
                 col_name = gift.get("collectionName")
-                if col_name not in ["Vice Cream", "Chill Flame"]:
+                if col_name not in TARGET_COLLECTIONS:
                     continue
 
                 # Get cached stable floor
@@ -962,7 +2374,6 @@ def offers_loop():
     - Offers are skipped if the price hasn't shifted by more than 0.05 TON
       since the last placed offer (to avoid spamming the API).
     """
-    TARGET_COLLECTIONS = ["Vice Cream", "Chill Flame"]
     log("Auto-offers background loop started (PAUSED until /offers_on).")
 
     while True:
@@ -1057,7 +2468,7 @@ def offers_loop():
 def main():
     log("========================================")
     log("Starting MRKT Sniper Bot...")
-    log("Target Collections: Vice Cream, Chill Flame")
+    log(f"Target Collections: {', '.join(TARGET_COLLECTIONS)}")
     log("========================================")
 
     # 1. Load config and set initial variables
@@ -1089,11 +2500,25 @@ def main():
     # Thread D: Auto-offers loop
     threading.Thread(target=offers_loop, daemon=True).start()
 
+    # Thread E: GetGems floor analyzer (idle until /getgems_on)
+    threading.Thread(target=getgems_floor_analyzer_loop, daemon=True).start()
+
+    # Thread F: GetGems alert sniper (idle until /getgems_on)
+    threading.Thread(target=getgems_sniper_loop, daemon=True).start()
+
+    # Thread G: Portals floor analyzer (idle until /portals_on)
+    threading.Thread(target=portals_floor_analyzer_loop, daemon=True).start()
+
+    # Thread H: Portals alert/buy sniper (idle until /portals_on)
+    threading.Thread(target=portals_sniper_loop, daemon=True).start()
+
     # Send startup message to registered chat ID
     tg_bot.send_message(
         "🤖 <b>MRKT Sniper Bot успешно запущен!</b>\n"
         "• Снайпер работает в фоновом режиме.\n"
         "• Авто-офферы: выключены (включить: /offers_on)\n"
+        "• GetGems-мониторинг: выключен (включить: /getgems_on)\n"
+        "• Portals-мониторинг: выключен (включить: /portals_on)\n"
         "• Отправьте /status для проверки текущего состояния и цен."
     )
 
